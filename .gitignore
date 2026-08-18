@@ -1,0 +1,2 @@
+# Transient SDD/git worktrees (never commit a worktree checkout)
+/.claude/worktrees/
