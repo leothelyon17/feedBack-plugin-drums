@@ -129,6 +129,250 @@ function _validateCustomMapping(raw) {
     return hasEntries ? clean : null;
 }
 
+// INIT-001/SPEC-005: kit JSON and vocabulary are untrusted. Piece-id maps
+// live in core kit records, never in the legacy drums_custom_map store.
+const _PIECE_ID_RE = /^[a-z][a-z0-9_]*$/;
+const _KIT_ID_RE = /^[a-z0-9-]+$/;
+const _DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+function _isSafeKey(key) {
+    return typeof key === 'string' && !_DANGEROUS_KEYS.has(key);
+}
+
+function _isPieceId(id) {
+    return typeof id === 'string' && _PIECE_ID_RE.test(id) && _isSafeKey(id);
+}
+
+function _parseMidiNote(value) {
+    const n = typeof value === 'number' ? value : parseInt(value, 10);
+    if (!Number.isInteger(n) || n < 0 || n > 127) return null;
+    return n;
+}
+
+function _escapeHtml(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function _eventTimeStamp(e) {
+    const ts = e && e.timeStamp;
+    return (typeof ts === 'number' && Number.isFinite(ts)) ? ts : 0;
+}
+
+// Fallback piece-id → lane-id, mirroring core PRESETS. Vocabulary presets
+// overlay this when GET /api/drums/vocabulary succeeds. ekit_full is out
+// of scope as a lane preset (lane-id model cannot express one-lane-per-piece).
+const _FALLBACK_PIECE_TO_LANE = {
+    phase_shift_8: {
+        hh_closed: 'hihat', hh_open: 'hihat', hh_pedal: 'hihat',
+        snare: 'snare', snare_xstick: 'snare',
+        tom_hi: 'tom1', tom_mid: 'tom2', tom_low: 'tom3', tom_floor: 'tom3',
+        crash_l: 'crash', crash_r: 'crash', splash: 'crash', china: 'crash', stack: 'crash',
+        ride: 'ride', ride_bell: 'ride', bell: 'ride',
+        kick: 'kick',
+    },
+    rb4: {
+        hh_closed: 'hihat', hh_open: 'hihat', hh_pedal: 'hihat',
+        snare: 'snare', snare_xstick: 'snare',
+        tom_hi: 'tom1', tom_mid: 'tom1', tom_low: 'tom3', tom_floor: 'tom3',
+        crash_l: 'crash', crash_r: 'crash', splash: 'crash', china: 'crash', stack: 'crash',
+        ride: 'ride', ride_bell: 'ride', bell: 'ride',
+        kick: 'kick',
+    },
+};
+
+let _knownPieceIds = new Set(Object.keys(_FALLBACK_PIECE_TO_LANE.phase_shift_8));
+let _pieceToLaneByPreset = {
+    phase_shift_8: Object.assign(Object.create(null), _FALLBACK_PIECE_TO_LANE.phase_shift_8),
+    rb4: Object.assign(Object.create(null), _FALLBACK_PIECE_TO_LANE.rb4),
+};
+let _vocabMidiToPiece = null;   // GM midi→piece from vocabulary (null = use PIECE_DEFAULT_MIDI)
+let _kitNotes = null;           // active_kit midi→piece overlay (null-prototype or null)
+let _kitList = [];              // [{id, name, manufacturer, source, notes}]
+let _activeKitId = null;
+let _pendingKitId = '';
+let _kitSuggestId = null;
+let _pendingPieceNotes = null;  // piece-id map accumulated by Learn until PUT
+
+function _knownPieces() {
+    return _knownPieceIds;
+}
+
+// Piece-id map helper. Accepts MIDI 0–127 keys whose values are known
+// piece-ids. Strips prototype-pollution keys. Unknown piece-ids are skipped
+// (never executed). Returns a null-prototype object, or null if empty.
+function _validatePieceMapping(raw, knownIds) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const known = knownIds || _knownPieceIds;
+    const clean = Object.create(null);
+    let hasEntries = false;
+    for (const key of Object.keys(raw)) {
+        if (!_isSafeKey(key)) continue;
+        const midi = _parseMidiNote(key);
+        if (midi === null) continue;
+        const val = raw[key];
+        if (!_isPieceId(val)) continue;
+        if (known && known.size && !known.has(val)) continue;
+        clean[midi] = val;
+        hasEntries = true;
+    }
+    return hasEntries ? clean : null;
+}
+
+function _parseKitNotes(kit) {
+    if (!kit || typeof kit !== 'object' || Array.isArray(kit)) return null;
+    return _validatePieceMapping(kit.notes, _knownPieceIds);
+}
+
+function _parseVocabulary(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const pieces = raw.pieces;
+    if (!pieces || typeof pieces !== 'object' || Array.isArray(pieces)) return null;
+    const ids = new Set();
+    const midiMap = Object.create(null);
+    const keys = Object.keys(pieces);
+    const cap = Math.min(keys.length, 64);
+    for (let i = 0; i < cap; i++) {
+        const id = keys[i];
+        if (!_isPieceId(id)) continue;
+        ids.add(id);
+        const spec = pieces[id];
+        const midiList = spec && Array.isArray(spec.midi) ? spec.midi : [];
+        const nCap = Math.min(midiList.length, 16);
+        for (let j = 0; j < nCap; j++) {
+            const n = _parseMidiNote(midiList[j]);
+            if (n !== null && midiMap[n] === undefined) midiMap[n] = id;
+        }
+    }
+    if (!ids.size) return null;
+    const pieceToLane = {
+        phase_shift_8: Object.assign(Object.create(null), _FALLBACK_PIECE_TO_LANE.phase_shift_8),
+        rb4: Object.assign(Object.create(null), _FALLBACK_PIECE_TO_LANE.rb4),
+    };
+    const presets = raw.presets;
+    if (presets && typeof presets === 'object' && !Array.isArray(presets)) {
+        for (const presetName of ['phase_shift_8', 'rb4']) {
+            const lanes = presets[presetName];
+            if (!Array.isArray(lanes)) continue;
+            const map = Object.assign(Object.create(null), pieceToLane[presetName]);
+            for (const lane of lanes) {
+                if (!lane || typeof lane !== 'object' || Array.isArray(lane)) continue;
+                const plist = Array.isArray(lane.pieces) ? lane.pieces : [];
+                const primary = plist.find(_isPieceId);
+                const laneId = primary ? (pieceToLane[presetName][primary] || null) : null;
+                if (!laneId || !_VALID_LANE_IDS.has(laneId)) continue;
+                for (const pid of plist) {
+                    if (!_isPieceId(pid)) continue;
+                    map[pid] = laneId;
+                }
+            }
+            pieceToLane[presetName] = map;
+        }
+    }
+    return { ids, midiMap, pieceToLane };
+}
+
+function _applyVocabulary(payload) {
+    const parsed = _parseVocabulary(payload);
+    if (!parsed) return false;
+    _knownPieceIds = parsed.ids;
+    _vocabMidiToPiece = parsed.midiMap;
+    _pieceToLaneByPreset = parsed.pieceToLane;
+    return true;
+}
+
+function _applyActiveKitNotes(kit) {
+    if (kit == null) {
+        _kitNotes = null;
+        return false;
+    }
+    const overlay = _parseKitNotes(kit);
+    _kitNotes = overlay || Object.create(null);
+    return overlay !== null;
+}
+
+function _pieceToLaneId(piece, presetName) {
+    if (!_isPieceId(piece)) return null;
+    const preset = presetName || _cfg.lanePreset;
+    const table = _pieceToLaneByPreset[preset] || _pieceToLaneByPreset.phase_shift_8;
+    const laneId = table[piece];
+    return (typeof laneId === 'string' && _VALID_LANE_IDS.has(laneId)) ? laneId : null;
+}
+
+function _primaryPieceForLane(laneId, presetName) {
+    const preset = presetName || _cfg.lanePreset;
+    const table = _pieceToLaneByPreset[preset] || _pieceToLaneByPreset.phase_shift_8;
+    for (const pid of _knownPieceIds) {
+        if (table[pid] === laneId) return pid;
+    }
+    return null;
+}
+
+function _deriveLaneMapFromPieces(pieceMap, presetName) {
+    if (!pieceMap) return null;
+    const clean = Object.create(null);
+    let hasEntries = false;
+    for (const key of Object.keys(pieceMap)) {
+        if (!_isSafeKey(key)) continue;
+        const midi = _parseMidiNote(key);
+        if (midi === null) continue;
+        const laneId = _pieceToLaneId(pieceMap[key], presetName);
+        if (!laneId) continue;
+        clean[midi] = laneId;
+        hasEntries = true;
+    }
+    return hasEntries ? clean : null;
+}
+
+function _mergeLaneMapAdditive(existing, midi, laneId) {
+    const n = _parseMidiNote(midi);
+    if (n === null || !_VALID_LANE_IDS.has(laneId)) return existing || null;
+    const merged = Object.assign(Object.create(null), existing || {});
+    merged[n] = laneId;
+    return _validateCustomMapping(merged);
+}
+
+function _suggestKitsForSource(logicalSourceKey, kits) {
+    // Match against logicalSourceKey only — never raw device labels.
+    if (typeof logicalSourceKey !== 'string' || !logicalSourceKey) return [];
+    const key = logicalSourceKey.toLowerCase();
+    const list = Array.isArray(kits) ? kits : [];
+    const out = [];
+    for (const kit of list) {
+        if (!kit || typeof kit !== 'object') continue;
+        const id = typeof kit.id === 'string' ? kit.id : '';
+        if (!_KIT_ID_RE.test(id)) continue;
+        const manufacturer = typeof kit.manufacturer === 'string' ? kit.manufacturer : '';
+        const tokens = [id, manufacturer.toLowerCase().replace(/\s+/g, '-')].filter(Boolean);
+        if (tokens.some(t => t.length >= 4 && key.indexOf(t) !== -1)) out.push(id);
+    }
+    return out;
+}
+
+function _sanitizeKitList(raw) {
+    const kits = raw && Array.isArray(raw.kits) ? raw.kits : (Array.isArray(raw) ? raw : []);
+    const out = [];
+    const cap = Math.min(kits.length, 64);
+    for (let i = 0; i < cap; i++) {
+        const kit = kits[i];
+        if (!kit || typeof kit !== 'object' || Array.isArray(kit)) continue;
+        const id = kit.id;
+        if (typeof id !== 'string' || !_KIT_ID_RE.test(id)) continue;
+        out.push({
+            id,
+            name: typeof kit.name === 'string' && kit.name ? kit.name : id,
+            manufacturer: typeof kit.manufacturer === 'string' ? kit.manufacturer : '',
+            source: kit.source === 'user' ? 'user' : 'shipped',
+            notes: kit.notes,
+        });
+    }
+    return out;
+}
+
 const _cfg = {
     midiInputId:    _readStore(STORE_KEYS.midiInputId) || '',
     synthVolume:    _readNum(STORE_KEYS.synthVolume, 0.7, 0, 1),
@@ -153,6 +397,10 @@ const _cfg = {
     // would imply N independent in-flight remap operations, which is
     // surprising when there's only one user + one MIDI kit.
     learnLane:      null,
+    // INIT-001/SPEC-005: Learn-on-pieces sentinel. Hit-to-assign writes
+    // a piece-id into the core kit and a derived lane id into the
+    // legacy store. Keyboard is not required to assign.
+    learnPiece:     null,
 };
 
 function _saveCfg(key, val) {
@@ -248,6 +496,10 @@ const PIECE_DEFAULT_MIDI = {
     china:        52,
     ride:         51,
     ride_bell:    53,
+    // Vocabulary fetch overlays these; kept here so offline drum_tab
+    // hits naming stack/bell still convert. GM: 30 unused, 80 mute triangle.
+    stack:        30,
+    bell:         80,
 };
 
 // Convert a drum_tab.hits[] payload into the legacy {t, s, f, ac, mt}
@@ -316,20 +568,20 @@ const LANE_PRESETS = {
     phase_shift_8: [
         { id: 'hihat',  label: 'HH', midiNotes: [42, 44, 46], color: [0.3, 0.6, 1.0], symbol: 'x'      },
         { id: 'snare',  label: 'Sn', midiNotes: [38, 40, 37], color: [1.0, 0.9, 0.2], symbol: 'circle' },
-        { id: 'tom1',   label: 'T1', midiNotes: [48, 50],     color: [0.3, 1.0, 0.3], symbol: 'circle' },
-        { id: 'tom2',   label: 'T2', midiNotes: [45, 47],     color: [1.0, 0.6, 0.1], symbol: 'circle' },
-        { id: 'tom3',   label: 'T3', midiNotes: [41, 43, 58], color: [0.7, 0.4, 1.0], symbol: 'circle' },
+        { id: 'tom1',   label: 'T1', midiNotes: [48, 50],     color: [0.3, 1.0, 0.3], symbol: 'square' },
+        { id: 'tom2',   label: 'T2', midiNotes: [45, 47],     color: [1.0, 0.6, 0.1], symbol: 'circle_dot' },
+        { id: 'tom3',   label: 'T3', midiNotes: [41, 43, 58], color: [0.7, 0.4, 1.0], symbol: 'square_dot' },
         { id: 'crash',  label: 'Cr', midiNotes: [49, 57, 55, 52], color: [0.2, 0.9, 0.9], symbol: 'diamond' },
-        { id: 'ride',   label: 'Ri', midiNotes: [51, 59, 53], color: [0.9, 0.9, 0.9], symbol: 'diamond' },
+        { id: 'ride',   label: 'Ri', midiNotes: [51, 59, 53], color: [0.9, 0.9, 0.9], symbol: 'hexagon' },
         { id: 'kick',   label: 'Ki', midiNotes: [35, 36],     color: [1.0, 0.2, 0.3], symbol: 'bar'    },
     ],
     rb4: [
         { id: 'hihat',  label: 'HH', midiNotes: [42, 44, 46], color: [0.3, 0.6, 1.0], symbol: 'x'      },
         { id: 'snare',  label: 'Sn', midiNotes: [38, 40, 37], color: [1.0, 0.9, 0.2], symbol: 'circle' },
-        { id: 'tom1',   label: 'T',  midiNotes: [48, 50, 45, 47], color: [0.3, 1.0, 0.3], symbol: 'circle' },
-        { id: 'tom3',   label: 'FT', midiNotes: [41, 43, 58], color: [0.7, 0.4, 1.0], symbol: 'circle' },
+        { id: 'tom1',   label: 'T',  midiNotes: [48, 50, 45, 47], color: [0.3, 1.0, 0.3], symbol: 'square' },
+        { id: 'tom3',   label: 'FT', midiNotes: [41, 43, 58], color: [0.7, 0.4, 1.0], symbol: 'square_dot' },
         { id: 'crash',  label: 'Cr', midiNotes: [49, 57, 55, 52], color: [0.2, 0.9, 0.9], symbol: 'diamond' },
-        { id: 'ride',   label: 'Ri', midiNotes: [51, 59, 53], color: [0.9, 0.9, 0.9], symbol: 'diamond' },
+        { id: 'ride',   label: 'Ri', midiNotes: [51, 59, 53], color: [0.9, 0.9, 0.9], symbol: 'hexagon' },
         { id: 'kick',   label: 'Ki', midiNotes: [35, 36],     color: [1.0, 0.2, 0.3], symbol: 'bar'    },
     ],
 };
@@ -352,20 +604,21 @@ function _applyLanePreset(presetName) {
 _applyLanePreset(_cfg.lanePreset);
 
 function _getActiveDrumMap() {
-    // For the settings mapping table and Learn-mode, return the custom map
-    // when set, otherwise derive the default map from _midiToLane (which is
-    // rebuilt by _applyLanePreset and is always preset-aware). This ensures
-    // that in rb4 mode MIDI notes 45/47 show as mapping to 'tom1' (their
-    // actual destination) rather than being omitted by a static map that
-    // lists them as 'tom2' — a lane that doesn't exist in rb4.
-    //
-    // When a customMapping is present, filter out any lane IDs that are not
-    // in the active preset so the mapping table and Learn-mode UI show the
-    // same effective mapping that _midiToLaneIdx() produces (i.e. entries
-    // that fall back to the preset-aware default are shown as unassigned
-    // rather than pointing at a lane that doesn't exist).
+    // INIT-001/SPEC-005: when a core kit is active, the settings table
+    // shows the derived lane view of that piece-id map. Otherwise the
+    // legacy lane-keyed customMapping (or GM default) is shown.
+    const activeLaneIds = new Set(DRUM_LANES.map(l => l.id));
+    if (_kitNotes) {
+        const derived = _deriveLaneMapFromPieces(_kitNotes);
+        const filtered = {};
+        if (derived) {
+            for (const [midi, laneId] of Object.entries(derived)) {
+                if (activeLaneIds.has(laneId)) filtered[midi] = laneId;
+            }
+        }
+        return filtered;
+    }
     if (_cfg.customMapping) {
-        const activeLaneIds = new Set(DRUM_LANES.map(l => l.id));
         const filtered = {};
         for (const [midi, laneId] of Object.entries(_cfg.customMapping)) {
             if (activeLaneIds.has(laneId)) filtered[midi] = laneId;
@@ -381,11 +634,22 @@ function _getActiveDrumMap() {
 }
 
 function _midiToLaneIdx(midiNote) {
-    // When the user has a custom mapping, honour it (maps MIDI → lane id string).
-    // When using the default, delegate to _midiToLane which is rebuilt by
-    // _applyLanePreset() and already returns the correct index for the active
-    // preset — avoiding stale lane-id references (e.g. 'tom2' in rb4 which
-    // has no tom2 lane, causing findIndex to return -1 for mid-tom live hits).
+    // INIT-001/SPEC-005 dual-read:
+    // 1. If a core active_kit is set, prefer its piece-id map (then piece→lane).
+    // 2. Else if drums_custom_map is a valid lane-keyed map, keep using it.
+    // 3. Else GM notes from the current lane preset.
+    // Unmapped kit notes fall through to GM, not to the legacy store.
+    if (_kitNotes) {
+        const piece = _kitNotes[midiNote];
+        if (piece) {
+            const laneId = _pieceToLaneId(piece);
+            if (laneId) {
+                const idx = DRUM_LANES.findIndex(l => l.id === laneId);
+                if (idx >= 0) return idx;
+            }
+        }
+        return _midiToLane[midiNote] !== undefined ? _midiToLane[midiNote] : -1;
+    }
     const custom = _cfg.customMapping;
     if (custom) {
         const laneId = custom[midiNote];
@@ -664,6 +928,7 @@ async function _midiConnect(key) {
     // Learn-mode is a module-scope sentinel, so clear once and
     // refresh every panel's Learn UI to keep buttons in sync.
     _cfg.learnLane = null;
+    _cfg.learnPiece = null;
     _updateLearnUI();
 
     // Persist regardless of match. Empty key is the explicit "None" option and
@@ -695,9 +960,19 @@ async function _midiConnect(key) {
         }
         if (res && res.handle) {
             _midiHandle = res.handle;
-            // The domain handle delivers raw MIDI data; adapt to the old
-            // MIDIMessageEvent shape so _midiOnMessage stays unchanged.
-            _midiListener = (data) => _midiOnMessage({ data });
+            // Domain handle delivers bytes (and sometimes an event-shaped
+            // object). Adapt so _midiOnMessage receives data plus timeStamp.
+            _midiListener = (payload) => {
+                // Domain currently delivers raw bytes (e.data). Accept either
+                // a MIDIMessageEvent-shaped object or a Uint8Array, and thread
+                // timeStamp (or 0) so later scoring can consume it.
+                if (payload && typeof payload === 'object' && payload.data != null
+                    && !ArrayBuffer.isView(payload)) {
+                    _midiOnMessage({ data: payload.data, timeStamp: payload.timeStamp });
+                } else {
+                    _midiOnMessage({ data: payload, timeStamp: 0 });
+                }
+            };
             // Wire the listener only when at least one renderer is active. A
             // late open() from an async _midiInit that resolved post-destroy
             // would otherwise re-enable scoring/synth in the background.
@@ -717,6 +992,7 @@ async function _midiConnect(key) {
         if (myGen === _midiConnectSeq) _midiInput = null;
     }
     _midiUpdateAllDeviceLists();
+    _maybeShowKitSuggestion();
 }
 
 function _midiPauseHandler() {
@@ -738,6 +1014,7 @@ function _midiPauseHandler() {
     // any reopened settings panel; if no panel is open right now
     // the call is a cheap no-op.
     _cfg.learnLane = null;
+    _cfg.learnPiece = null;
     _updateLearnUI();
 }
 
@@ -783,13 +1060,18 @@ function _midiOnMessage(e) {
     // between teardowns, or no instance initialised yet).
     if (!_activeInstance) return;
 
-    const [status, note, velocity] = e.data;
+    const data = e && e.data;
+    if (!data || data.length < 3) return;
+    const status = data[0];
+    const note = data[1];
+    const velocity = data[2];
     const ch = status & 0x0F;
     if (_cfg.midiChannel >= 0 && ch !== _cfg.midiChannel) return;
 
     const cmd = status & 0xF0;
     if (cmd === 0x90 && velocity > 0) {
-        _activeInstance._handleDrumHit(note, velocity);
+        // INIT-001/SPEC-005: thread DOM timeStamp (or 0) into the hit path.
+        _activeInstance._handleDrumHit(note, velocity, _eventTimeStamp(e));
     }
     // Drums don't need note-off handling (one-shot hits)
 }
@@ -831,42 +1113,92 @@ function _midiUpdateAllDeviceLists() {
 // "..." pending indicator and the active-lane highlight reflect the
 // shared _cfg.learnLane sentinel.
 function _updateLearnUI() {
+    if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') return;
     const learnBtns = document.querySelectorAll('.drums-learn-btn');
     learnBtns.forEach(btn => {
-        const idx = parseInt(btn.dataset.lane);
-        btn.textContent = _cfg.learnLane === idx ? '...' : 'Learn';
-        btn.style.color = _cfg.learnLane === idx ? '#ff0' : '#aaa';
+        const piece = btn.dataset.piece;
+        const pending = piece
+            ? _cfg.learnPiece === piece
+            : _cfg.learnLane === parseInt(btn.dataset.lane, 10);
+        btn.textContent = pending ? '...' : 'Learn';
+        btn.style.color = pending ? '#ff0' : '#aaa';
+        btn.setAttribute('aria-pressed', pending ? 'true' : 'false');
     });
+}
+
+function _learnButtonHtml(attrs, pending) {
+    return `<button type="button" class="drums-learn-btn" ${attrs} aria-label="Learn MIDI mapping"
+        aria-pressed="${pending ? 'true' : 'false'}"
+        style="background:#1a1a2e;border:1px solid #333;border-radius:4px;padding:1px 6px;
+        font-size:10px;color:${pending ? '#ff0' : '#aaa'};cursor:pointer;">${pending ? '...' : 'Learn'}</button>`;
+}
+
+function _piecesForLane(laneId) {
+    const table = _pieceToLaneByPreset[_cfg.lanePreset] || _pieceToLaneByPreset.phase_shift_8;
+    const out = [];
+    for (const pid of _knownPieceIds) {
+        if (table[pid] === laneId) out.push(pid);
+    }
+    return out;
+}
+
+function _notesForPiece(pieceId) {
+    const assigned = [];
+    if (_kitNotes) {
+        for (const [midi, pid] of Object.entries(_kitNotes)) {
+            if (pid === pieceId) assigned.push(midi);
+        }
+    }
+    return assigned.join(', ');
 }
 
 // Build the mapping table rows from the active drum map. Module-scope
 // because customMapping is module-shared state — every open settings
 // panel (across N splitscreen drum instances) should render the same
-// rows. References only module-scope identifiers (DRUM_LANES, _cfg,
-// _getActiveDrumMap, _rgbStr).
+// rows. Piece-ids interpolated here are regex-validated first.
 function _buildMappingRows() {
+    const map = _getActiveDrumMap();
     return DRUM_LANES.map((lane, idx) => {
-        const map = _getActiveDrumMap();
+        const pieces = _piecesForLane(lane.id);
+        if (pieces.length) {
+            return pieces.map((pid, pIdx) => {
+                if (!_isPieceId(pid)) return '';
+                const pending = _cfg.learnPiece === pid;
+                const notes = _escapeHtml(_notesForPiece(pid) || 'none');
+                const label = _escapeHtml(pid.replace(/_/g, ' '));
+                const laneCell = pIdx === 0
+                    ? `<td style="color:${_rgbStr(lane.color[0], lane.color[1], lane.color[2])};font-weight:bold;padding:2px 6px;" rowspan="${pieces.length}">${lane.label}</td>`
+                    : '';
+                return `<tr>
+                    ${laneCell}
+                    <td style="color:#ccc;padding:2px 6px;font-size:10px;">${label}</td>
+                    <td style="color:#888;padding:2px 6px;font-size:10px;">${notes}</td>
+                    <td style="padding:2px 4px;">${_learnButtonHtml('data-piece="' + pid + '"', pending)}</td>
+                </tr>`;
+            }).join('');
+        }
         const assigned = Object.entries(map).filter(([_, v]) => v === lane.id).map(([k]) => k).join(', ');
+        const pending = _cfg.learnLane === idx;
         return `<tr>
             <td style="color:${_rgbStr(lane.color[0], lane.color[1], lane.color[2])};font-weight:bold;padding:2px 6px;">${lane.label}</td>
-            <td style="color:#888;padding:2px 6px;font-size:10px;">${assigned || 'none'}</td>
-            <td style="padding:2px 4px;"><button class="drums-learn-btn" data-lane="${idx}"
-                style="background:#1a1a2e;border:1px solid #333;border-radius:4px;padding:1px 6px;
-                font-size:10px;color:${_cfg.learnLane === idx ? '#ff0' : '#aaa'};cursor:pointer;">${_cfg.learnLane === idx ? '...' : 'Learn'}</button></td>
+            <td style="color:#888;padding:2px 6px;font-size:10px;">${_escapeHtml(assigned || 'none')}</td>
+            <td style="padding:2px 4px;">${_learnButtonHtml('data-lane="' + idx + '"', pending)}</td>
         </tr>`;
     }).join('');
 }
 
-// Re-bind Learn-button onclicks within a freshly-rebuilt mapping
-// table. Module-scope because the handler only mutates _cfg.learnLane
-// (module-shared) and calls _updateLearnUI (also module-scope) —
-// no per-instance closure needed.
 function _wireLearnButtons(scope) {
     scope.querySelectorAll('.drums-learn-btn').forEach(btn => {
         btn.onclick = function () {
-            const idx = parseInt(this.dataset.lane);
-            _cfg.learnLane = _cfg.learnLane === idx ? null : idx;
+            const piece = this.dataset.piece;
+            if (piece && _isPieceId(piece)) {
+                _cfg.learnPiece = _cfg.learnPiece === piece ? null : piece;
+                _cfg.learnLane = null;
+            } else {
+                const idx = parseInt(this.dataset.lane, 10);
+                _cfg.learnLane = _cfg.learnLane === idx ? null : idx;
+                _cfg.learnPiece = null;
+            }
             _updateLearnUI();
         };
     });
@@ -879,6 +1211,7 @@ function _wireLearnButtons(scope) {
 // was never opened simply don't have a `.drums-map-table` node yet,
 // and they pick up the current state when the panel opens later.
 function _refreshAllMappingTables() {
+    if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') return;
     const tables = document.querySelectorAll('.drums-map-table');
     if (!tables.length) return;
     const html = _buildMappingRows();
@@ -886,6 +1219,211 @@ function _refreshAllMappingTables() {
         tbl.innerHTML = html;
         _wireLearnButtons(tbl);
     });
+}
+
+async function _fetchJson(url, opts) {
+    if (typeof fetch !== 'function') return null;
+    try {
+        const res = await fetch(url, opts);
+        if (!res || !res.ok) return null;
+        return await res.json();
+    } catch (_) {
+        return null;
+    }
+}
+
+function _kitPutBody(kitId, notes, existing) {
+    const notesOut = Object.create(null);
+    const src = notes || {};
+    for (const key of Object.keys(src)) {
+        if (!_isSafeKey(key)) continue;
+        const midi = _parseMidiNote(key);
+        const piece = src[key];
+        if (midi === null || !_isPieceId(piece)) continue;
+        if (_knownPieceIds.size && !_knownPieceIds.has(piece)) continue;
+        notesOut[String(midi)] = piece;
+    }
+    const name = existing && typeof existing.name === 'string' && existing.name
+        ? existing.name : kitId;
+    return {
+        id: kitId,
+        name,
+        notes: notesOut,
+        verified: false,
+    };
+}
+
+async function _commitLearnAssignment(midiNote, pieceId) {
+    const n = _parseMidiNote(midiNote);
+    if (n === null || !_isPieceId(pieceId)) return null;
+    const laneId = _pieceToLaneId(pieceId);
+    if (laneId) {
+        _saveCfg('customMapping', _mergeLaneMapAdditive(_cfg.customMapping, n, laneId));
+    }
+
+    const kitId = (_activeKitId && _KIT_ID_RE.test(_activeKitId)) ? _activeKitId : 'user-kit';
+    const nextNotes = Object.create(null);
+    const seed = _kitNotes || _pendingPieceNotes;
+    if (seed) {
+        for (const [k, v] of Object.entries(seed)) nextNotes[k] = v;
+    }
+    nextNotes[n] = pieceId;
+    _pendingPieceNotes = _validatePieceMapping(nextNotes, _knownPieceIds) || nextNotes;
+    // Scoring overlay follows a confirmed active_kit only — never silent bind.
+    if (_activeKitId) {
+        _kitNotes = _validatePieceMapping(nextNotes, _knownPieceIds);
+    }
+    const existing = _kitList.find(k => k.id === kitId);
+    const body = _kitPutBody(kitId, _pendingPieceNotes, existing);
+    await _fetchJson('/api/drums/kits/' + encodeURIComponent(kitId), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    });
+    if (!_kitList.some(k => k.id === kitId)) {
+        _kitList.push({ id: kitId, name: body.name, manufacturer: '', source: 'user', notes: body.notes });
+    }
+    return { kitId, laneId, pieceId };
+}
+
+async function _confirmActiveKit(kitId) {
+    if (typeof kitId !== 'string' || !_KIT_ID_RE.test(kitId)) return false;
+    const listed = _kitList.find(k => k.id === kitId);
+    let kit = listed;
+    const fetched = await _fetchJson('/api/drums/kits/' + encodeURIComponent(kitId));
+    if (fetched) kit = fetched;
+    if (!kit) return false;
+    _activeKitId = kitId;
+    _applyActiveKitNotes(kit);
+    _pendingPieceNotes = _kitNotes;
+    _kitSuggestId = null;
+    await _fetchJson('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ active_kit: kitId }),
+    });
+    _refreshKitSelects();
+    _refreshAllMappingTables();
+    _refreshKitSuggestBanners();
+    return true;
+}
+
+function _refreshKitSelects() {
+    if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') return;
+    const selects = document.querySelectorAll('.drums-kit-select');
+    for (const sel of selects) {
+        const current = sel.value;
+        sel.textContent = '';
+        const noneOpt = document.createElement('option');
+        noneOpt.value = '';
+        noneOpt.textContent = 'None (GM / Learn map)';
+        sel.appendChild(noneOpt);
+        for (const kit of _kitList) {
+            const opt = document.createElement('option');
+            opt.value = kit.id;
+            opt.textContent = kit.name || kit.id;
+            sel.appendChild(opt);
+        }
+        const pick = _pendingKitId || _activeKitId || current || '';
+        if (pick && [...sel.options].some(o => o.value === pick)) sel.value = pick;
+        else sel.value = '';
+    }
+    document.querySelectorAll('.drums-kit-confirm').forEach(btn => {
+        const sel = btn.closest('.drums-settings-panel')
+            && btn.closest('.drums-settings-panel').querySelector('.drums-kit-select');
+        const chosen = sel ? sel.value : '';
+        btn.disabled = !chosen || chosen === _activeKitId;
+    });
+}
+
+function _refreshKitSuggestBanners() {
+    if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') return;
+    const banners = document.querySelectorAll('.drums-kit-suggest');
+    banners.forEach(el => {
+        el.textContent = '';
+        if (!_kitSuggestId) {
+            el.hidden = true;
+            return;
+        }
+        const kit = _kitList.find(k => k.id === _kitSuggestId);
+        const name = kit && kit.name ? kit.name : _kitSuggestId;
+        el.hidden = false;
+        const text = document.createElement('span');
+        text.textContent = 'Suggested kit: ' + name + '. ';
+        const confirm = document.createElement('button');
+        confirm.type = 'button';
+        confirm.className = 'drums-kit-suggest-confirm';
+        confirm.textContent = 'Use this kit';
+        confirm.setAttribute('aria-label', 'Confirm suggested kit ' + name);
+        confirm.onclick = function () { _confirmActiveKit(_kitSuggestId); };
+        const dismiss = document.createElement('button');
+        dismiss.type = 'button';
+        dismiss.textContent = 'Dismiss';
+        dismiss.setAttribute('aria-label', 'Dismiss kit suggestion');
+        dismiss.onclick = function () {
+            _kitSuggestId = null;
+            _refreshKitSuggestBanners();
+        };
+        el.appendChild(text);
+        el.appendChild(confirm);
+        el.appendChild(dismiss);
+    });
+}
+
+function _maybeShowKitSuggestion() {
+    if (_activeKitId) {
+        _kitSuggestId = null;
+        _refreshKitSuggestBanners();
+        return;
+    }
+    const key = _midiInput && _midiInput.key;
+    const hits = _suggestKitsForSource(key, _kitList);
+    _kitSuggestId = hits.length ? hits[0] : null;
+    _refreshKitSuggestBanners();
+}
+
+async function _consumeCoreKits() {
+    const vocab = await _fetchJson('/api/drums/vocabulary');
+    if (vocab) _applyVocabulary(vocab);
+    const listed = await _fetchJson('/api/drums/kits');
+    if (listed) _kitList = _sanitizeKitList(listed);
+    const settings = await _fetchJson('/api/settings');
+    const kitId = settings && typeof settings.active_kit === 'string' ? settings.active_kit : null;
+    if (kitId && _KIT_ID_RE.test(kitId)) {
+        const kit = await _fetchJson('/api/drums/kits/' + encodeURIComponent(kitId));
+        if (kit) {
+            _activeKitId = kitId;
+            _applyActiveKitNotes(kit);
+        } else {
+            _activeKitId = null;
+            _applyActiveKitNotes(null);
+        }
+    } else {
+        _activeKitId = null;
+        _applyActiveKitNotes(null);
+    }
+    _refreshKitSelects();
+    _refreshAllMappingTables();
+    _maybeShowKitSuggestion();
+}
+
+function _wireKitControls(scope) {
+    const sel = scope.querySelector('.drums-kit-select');
+    const confirm = scope.querySelector('.drums-kit-confirm');
+    if (sel) {
+        sel.onchange = function () {
+            _pendingKitId = this.value || '';
+            _refreshKitSelects();
+        };
+    }
+    if (confirm) {
+        confirm.onclick = function () {
+            const chosen = sel ? sel.value : '';
+            if (chosen) _confirmActiveKit(chosen);
+        };
+    }
+    _refreshKitSelects();
+    _refreshKitSuggestBanners();
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1105,25 +1643,41 @@ function createFactory() {
 
     // ── MIDI event handler (called by _midiOnMessage via _activeInstance) ──
 
-    function _handleDrumHit(midiNote, velocity) {
+    function _handleDrumHit(midiNote, velocity, timeStamp) {
         if (midiNote < 0 || midiNote > 127) return;
+        const ts = _eventTimeStamp({ timeStamp });
 
-        // Learn mode: assign this MIDI note to the pending lane.
-        // _cfg.learnLane is module-scope so the assignment + UI
-        // refresh apply uniformly across every open settings panel.
-        if (_cfg.learnLane !== null) {
-            // Use the full customMapping (not the filtered active-only view) so
-            // that inactive preset lane assignments (e.g. tom2 in rb4 mode) are
-            // preserved — only the new assignment is added/overwritten.
-            const map = Object.assign({}, _cfg.customMapping || _getActiveDrumMap());
-            map[midiNote] = DRUM_LANES[_cfg.learnLane].id;
-            _saveCfg('customMapping', map);
+        // INIT-001/SPEC-005: Learn-on-pieces first (wizard), then legacy
+        // lane Learn. Both writer paths PUT a piece-id kit and merge a
+        // derived lane id into drums_custom_map additively.
+        if (_cfg.learnPiece) {
+            const pieceId = _cfg.learnPiece;
+            _cfg.learnPiece = null;
             _cfg.learnLane = null;
+            _commitLearnAssignment(midiNote, pieceId).then(() => {
+                _updateLearnUI();
+                _refreshAllMappingTables();
+            });
             _updateLearnUI();
-            // Rebuild the "assigned" column on EVERY open settings
-            // panel — customMapping is module-shared, so a Learn
-            // assignment from the focused panel must also update
-            // any other splitscreen panel's open settings table.
+            return;
+        }
+        if (_cfg.learnLane !== null) {
+            const lane = DRUM_LANES[_cfg.learnLane];
+            const laneId = lane && lane.id;
+            const pieceId = laneId ? _primaryPieceForLane(laneId) : null;
+            _cfg.learnLane = null;
+            _cfg.learnPiece = null;
+            if (pieceId) {
+                _commitLearnAssignment(midiNote, pieceId).then(() => {
+                    _updateLearnUI();
+                    _refreshAllMappingTables();
+                });
+            } else if (laneId) {
+                const map = Object.assign({}, _cfg.customMapping || _getActiveDrumMap());
+                map[midiNote] = laneId;
+                _saveCfg('customMapping', map);
+            }
+            _updateLearnUI();
             _refreshAllMappingTables();
             return;
         }
@@ -1143,13 +1697,14 @@ function createFactory() {
         }
 
         if (_cfg.hitDetection) {
-            _checkHit(midiNote);
+            _checkHit(midiNote, ts);
         }
     }
 
     // ── Hit detection / accuracy scoring (against cached filter-aware arrays) ──
 
-    function _checkHit(playedMidi) {
+    function _checkHit(playedMidi, timeStamp) {
+        void timeStamp;
         const t = _latestTime;
         const notes = _latestNotes;
         const chords = _latestChords;
@@ -1405,6 +1960,20 @@ function createFactory() {
                 <button class="drums-reset-map" style="background:#1a1a2e;border:1px solid #333;border-radius:4px;
                     padding:2px 8px;font-size:10px;color:#aaa;cursor:pointer;">Reset Map</button>
             </div>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:4px;">
+                <label style="display:flex;align-items:center;gap:4px;font-size:10px;color:#666;">
+                    Kit
+                    <select class="drums-kit-select" aria-label="Drum kit"
+                        style="background:#1a1a2e;border:1px solid #333;border-radius:6px;
+                        padding:3px 6px;font-size:11px;color:#ccc;outline:none;max-width:180px;">
+                    </select>
+                </label>
+                <button type="button" class="drums-kit-confirm" aria-label="Use this kit"
+                    style="background:#1a1a2e;border:1px solid #555;border-radius:4px;
+                    padding:2px 8px;font-size:10px;color:#ddd;cursor:pointer;">Use this kit</button>
+            </div>
+            <div class="drums-kit-suggest" role="status" hidden
+                style="font-size:10px;color:#ccc;margin-bottom:4px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;"></div>
             <details style="margin-top:2px;">
                 <summary style="font-size:10px;color:#666;cursor:pointer;">MIDI Mapping</summary>
                 <table class="drums-map-table" style="font-size:11px;margin-top:4px;">${_buildMappingRows()}</table>
@@ -1442,6 +2011,7 @@ function createFactory() {
             // changed, so a stale _cfg.learnLane could index beyond DRUM_LANES
             // bounds in _handleDrumHit() or remap into the wrong lane.
             _cfg.learnLane = null;
+            _cfg.learnPiece = null;
             document.querySelectorAll('.drums-lane-preset').forEach(sel => {
                 sel.value = _cfg.lanePreset;
             });
@@ -1466,6 +2036,9 @@ function createFactory() {
         };
 
         _wireLearnButtons(panel);
+        _wireKitControls(panel);
+        _midiUpdateAllDeviceLists();
+        _consumeCoreKits();
     }
 
     function _removeSettingsPanel() {
@@ -1695,6 +2268,54 @@ function createFactory() {
                 if (isActive && !useMissColor) {
                     ctx.fillStyle = _rgbStr(cr, cg, cb, 0.12);
                     ctx.fillRect(fullLeft, nowLineY - 5, fullRight - fullLeft, 10);
+                }
+            } else if (lane.symbol === 'square' || lane.symbol === 'square_dot') {
+                const size = (ll.w * 0.32) * velFactor;
+                const half = size / 2;
+                ctx.fillStyle = _rgbStr(cr, cg, cb, useMissColor ? 0.3 : 1);
+                ctx.fillRect(cx - half, y - half, size, size);
+                if (!useMissColor) {
+                    ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+                    ctx.lineWidth = 1;
+                    ctx.strokeRect(cx - half, y - half, size, size);
+                }
+                if (lane.symbol === 'square_dot' && !useMissColor && half > 3) {
+                    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+                    ctx.fillRect(cx - half * 0.28, y - half * 0.28, half * 0.56, half * 0.56);
+                }
+            } else if (lane.symbol === 'circle_dot') {
+                const radius = (ll.w * 0.18) * velFactor;
+                ctx.fillStyle = _rgbStr(cr, cg, cb, useMissColor ? 0.3 : 1);
+                ctx.beginPath();
+                ctx.arc(cx, y, radius, 0, Math.PI * 2);
+                ctx.fill();
+                if (!useMissColor) {
+                    ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.arc(cx, y, radius, 0, Math.PI * 2);
+                    ctx.stroke();
+                    ctx.fillStyle = 'rgba(0,0,0,0.75)';
+                    ctx.beginPath();
+                    ctx.arc(cx, y, Math.max(1.5, radius * 0.28), 0, Math.PI * 2);
+                    ctx.fill();
+                }
+            } else if (lane.symbol === 'hexagon') {
+                const size = (ll.w * 0.22) * velFactor;
+                ctx.fillStyle = _rgbStr(cr, cg, cb, useMissColor ? 0.3 : 1);
+                ctx.beginPath();
+                for (let i = 0; i < 6; i++) {
+                    const a = (Math.PI / 3) * i - Math.PI / 6;
+                    const px = cx + size * Math.cos(a);
+                    const py = y + size * Math.sin(a);
+                    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+                }
+                ctx.closePath();
+                ctx.fill();
+                if (!useMissColor) {
+                    ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+                    ctx.lineWidth = 1;
+                    ctx.stroke();
                 }
             } else if (lane.symbol === 'diamond') {
                 const size = (ll.w * 0.25) * velFactor;
@@ -1959,6 +2580,7 @@ function createFactory() {
             // already populated.
             _midiInit();
             _synthInit();
+            _consumeCoreKits();
 
             _isReady = true;
 
@@ -2106,8 +2728,21 @@ if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         noteToMidi, _rgbStr, _validateCustomMapping, _drumTabHitsToNotes,
         _applyLanePreset, _getActiveDrumMap, _midiToLaneIdx, _songNoteToLaneIdx,
-        _midiResolveSaved, DRUM_LANES, PIECE_DEFAULT_MIDI,
+        _midiResolveSaved, DRUM_LANES, PIECE_DEFAULT_MIDI, LANE_PRESETS,
         matchesArrangement: createFactory.matchesArrangement,
+        // INIT-001/SPEC-005
+        _validatePieceMapping, _parseKitNotes, _applyVocabulary, _applyActiveKitNotes,
+        _pieceToLaneId, _deriveLaneMapFromPieces, _mergeLaneMapAdditive,
+        _suggestKitsForSource, _eventTimeStamp, _midiOnMessage, _escapeHtml,
+        _commitLearnAssignment, _confirmActiveKit, _primaryPieceForLane,
+        _sanitizeKitList,
+        _setActiveInstance(inst) { _activeInstance = inst; },
+        _getKitNotes() { return _kitNotes; },
+        _getActiveKitId() { return _activeKitId; },
+        _setKitList(list) { _kitList = Array.isArray(list) ? list : []; },
+        _saveCfg,
+        _cfg,
+        _knownPieces,
     };
 }
 

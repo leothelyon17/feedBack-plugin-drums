@@ -25,11 +25,11 @@ A plugin for [Slopsmith](https://github.com/got-feedback/feedback) that replaces
 |------|-------|-----------|-------|-------|
 | Hi-Hat | HH | 42, 44, 46 | Blue | X |
 | Snare | Sn | 38, 40 | Yellow | Circle |
-| Tom 1 | T1 | 48, 50 | Green | Circle |
-| Tom 2 | T2 | 45, 47 | Orange | Circle |
-| Tom 3 | T3 | 41, 43 | Purple | Circle |
+| Tom 1 | T1 | 48, 50 | Green | Square |
+| Tom 2 | T2 | 45, 47 | Orange | Circle with center dot |
+| Tom 3 | T3 | 41, 43 | Purple | Square with center mark |
 | Crash | Cr | 49, 57 | Cyan | Diamond |
-| Ride | Ri | 51, 59 | White | Diamond |
+| Ride | Ri | 51, 59 | White | Hexagon |
 | Kick | Ki | 35, 36 | Red | Full-width bar |
 
 ## Requirements
@@ -62,14 +62,16 @@ Connect a USB MIDI drum pad or electronic kit and select it from the settings pa
 
 ### Custom Mapping
 
-Different drum pads send different MIDI note numbers. Use the "Learn" mode in settings to remap:
+Different drum pads send different MIDI note numbers. Use "Learn" in settings to remap by hitting a pad (keyboard is not required):
 
 1. Open settings and expand "MIDI Mapping"
-2. Click "Learn" next to a lane (e.g., Snare)
-3. Hit the pad you want to assign to that lane
-4. The MIDI note is saved to that lane
+2. Click "Learn" next to a piece (for example snare or tom hi)
+3. Hit the pad you want to assign
+4. The plugin saves a piece-id map to a core user kit (`PUT /api/drums/kits/{id}`) and a derived lane map into the existing Learn store
 
-Click "Reset Map" to return to standard GM mapping.
+Shipped kits (for example Alesis Strata Prime) appear in the Kit dropdown. Selecting one **requires** clicking **Use this kit** — the plugin may suggest a kit from the MIDI source key, but it never auto-applies.
+
+Click "Reset Map" to clear the local lane map (core kits are unchanged).
 
 ## License
 
