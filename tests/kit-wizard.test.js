@@ -92,23 +92,41 @@ test('rb4 piece map has no tom2 lane', () => {
     assert.equal(mod.DRUM_LANES.findIndex(l => l.id === 'tom2'), -1);
 });
 
-test('ac-3: Learn PUT writes piece-ids and additive lane ids (not piece-ids in legacy store)', async () => {
-    const puts = [];
+test('ac-3: Learn PUT is atomic, API-first, and never writes active_kit', async () => {
+    const calls = [];
     const mod = freshPlugin();
     global.fetch = async (url, init) => {
-        puts.push({ url, init });
-        return { ok: true, json: async () => ({ id: 'user-kit' }) };
+        calls.push({ url, method: (init && init.method) || 'GET', body: init && init.body });
+        if (String(url).includes('/notes/')) {
+            return {
+                ok: true,
+                json: async () => ({
+                    kit: { id: 'user-kit', notes: { '48': 'tom_hi' } },
+                    mutation: { midi_note: 48, operation: 'set', piece_id: 'tom_hi' },
+                    resolution: { piece_id: 'tom_hi', source: 'kit' },
+                }),
+            };
+        }
+        if (String(url).includes('/api/settings')) {
+            return { ok: true, json: async () => ({}) };
+        }
+        return { ok: true, json: async () => ({ id: 'user-kit', notes: {} }) };
     };
+    mod._setKitList([{ id: 'user-kit', name: 'User', notes: {} }]);
+    await mod._confirmActiveKit('user-kit');
+    assert.equal(mod._getActiveKitId(), 'user-kit');
+    const beforeSettings = calls.filter(c => c.url.includes('/api/settings')).length;
     const result = await mod._commitLearnAssignment(48, 'tom_hi');
     assert.equal(result.pieceId, 'tom_hi');
     assert.equal(result.laneId, 'tom1');
-    const put = puts.find(p => p.init && p.init.method === 'PUT');
-    assert.ok(put, 'expected PUT /api/drums/kits/{id}');
-    const body = JSON.parse(put.init.body);
-    assert.equal(body.notes['48'], 'tom_hi');
+    const notePut = calls.find(c => c.method === 'PUT' && String(c.url).includes('/notes/48'));
+    assert.ok(notePut, 'expected PUT /api/drums/kits/{id}/notes/{midi}');
+    assert.equal(JSON.parse(notePut.body).piece_id, 'tom_hi');
     assert.equal(mod._cfg.customMapping[48], 'tom1');
     assert.equal(mod._validateCustomMapping({ 48: 'tom_hi' }), null);
-    assert.equal(mod._getActiveKitId(), null);
+    const afterSettings = calls.filter(c => c.url.includes('/api/settings')).length;
+    assert.equal(afterSettings, beforeSettings, 'Learn must not write active_kit');
+    assert.equal(mod._getActiveKitId(), 'user-kit');
 });
 
 test('ac-4: _midiOnMessage forwards e.timeStamp or 0', () => {
