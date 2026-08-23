@@ -17,7 +17,7 @@ A plugin for [Slopsmith](https://github.com/got-feedback/feedback) that replaces
 - **Custom MIDI mapping** — "Learn" mode to assign any MIDI note to any lane, for non-standard drum pads
 - **Built-in drum sounds** — WebAudioFont-powered GM drum kit playback on MIDI hit
 - **Accuracy scoring** — hit detection with tight +/-50ms timing window, accuracy %, streak counter
-- **Inline settings** — MIDI device, volume, channel filter, lane labels, hit detection, and mapping table
+- **Drum settings editor** — Device / Map / Highway plus named profiles in Settings → Drums, remounted from the in-song gear
 
 ## Drum Lanes
 
@@ -45,7 +45,7 @@ git clone https://github.com/got-feedback/feedback-plugin-drums.git drums
 docker compose restart
 ```
 
-A "Drums" button will appear in the player controls when you play a song. Click the gear icon next to it to configure MIDI input and sound settings.
+A "Drums" button will appear in the player controls when you play a song. The gear opens the same Drum settings editor as Settings → Drums (Device / Map / Highway). Only one editor instance is mounted at a time.
 
 ## How It Works
 
@@ -64,8 +64,8 @@ Connect a USB MIDI drum pad or electronic kit and select it from the settings pa
 
 Different drum pads send different MIDI note numbers. Use "Learn" in settings to remap by hitting a pad (keyboard is not required):
 
-1. Open settings and expand "MIDI Mapping"
-2. Click "Learn" next to a piece (for example snare or tom hi)
+1. Open Drum settings (Settings → Drums, or the in-song gear)
+2. In the Map section, click "Learn" next to a piece (for example snare or tom hi)
 3. Hit the pad you want to assign
 4. The plugin saves a piece-id map to a core user kit (`PUT /api/drums/kits/{id}`) and a derived lane map into the existing Learn store
 

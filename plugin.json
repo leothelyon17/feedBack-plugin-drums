@@ -1,10 +1,15 @@
 {
   "id": "drums",
   "name": "Drum Highway",
-  "version": "4.0.0",
+  "version": "4.1.0",
   "type": "visualization",
   "private": false,
   "script": "screen.js",
+  "settings": {
+    "html": "settings.html",
+    "category": "drums"
+  },
+  "styles": "assets/drums-editor.css",
   "standards": [
     "capability-pipelines.v1",
     "plugin-runtime-idempotent.v1"

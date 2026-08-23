@@ -1,0 +1,160 @@
+/* INIT-003/SPEC-005: plugin-owned Drum editor chrome. Core Tailwind is
+   not scanned for these selectors; keep layout here. */
+.drums-editor {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    color: #d1d5db;
+    font-family: system-ui, sans-serif;
+    font-size: 13px;
+}
+
+.drums-editor-chrome {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: rgba(17, 24, 39, 0.96);
+    border: 1px solid #1f2937;
+    border-radius: 8px;
+    padding: 8px 10px;
+}
+
+.drums-editor-chrome-row,
+.drums-editor-row,
+.drums-editor-chrome-actions,
+.drums-editor-name-form {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+}
+
+.drums-editor-field {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: #9ca3af;
+}
+
+.drums-editor-field--grow {
+    flex: 1 1 12rem;
+}
+
+.drums-editor-field span,
+.drums-editor-check span {
+    white-space: nowrap;
+}
+
+.drums-editor select,
+.drums-editor input[type="text"] {
+    background: #1a1a2e;
+    border: 1px solid #333;
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 12px;
+    color: #ccc;
+    outline: none;
+    max-width: 220px;
+}
+
+.drums-editor input[type="text"] {
+    width: 100%;
+    max-width: none;
+}
+
+.drums-editor-check {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: #9ca3af;
+    cursor: pointer;
+}
+
+.drums-editor button {
+    background: #1a1a2e;
+    border: 1px solid #444;
+    border-radius: 4px;
+    padding: 4px 10px;
+    font-size: 11px;
+    color: #ddd;
+    cursor: pointer;
+}
+
+.drums-editor button:hover,
+.drums-editor button:focus-visible {
+    border-color: #9ca3af;
+    color: #fff;
+}
+
+.drums-editor button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.drums-editor-live,
+.drums-map-status,
+.drums-kit-suggest {
+    min-height: 1.2em;
+    font-size: 11px;
+    color: #d1d5db;
+    margin: 0;
+}
+
+.drums-editor-section h3 {
+    margin: 0 0 6px;
+    font-size: 12px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #9ca3af;
+}
+
+.drums-editor-map-wrap {
+    overflow: auto;
+    margin-top: 6px;
+}
+
+.drums-map-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11px;
+}
+
+.drums-editor-dialog-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+}
+
+.drums-editor-dialog-sheet {
+    position: relative;
+    z-index: 1;
+    margin: 6vh auto 0;
+    width: min(720px, calc(100% - 24px));
+    max-height: 88vh;
+    overflow: auto;
+    background: #0b1220;
+    border: 1px solid #1f2937;
+    border-radius: 12px;
+    padding: 12px 14px 16px;
+    pointer-events: auto;
+}
+
+.drums-editor-dialog-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 8px;
+}
+
+.drums-editor-dialog-title {
+    margin: 0;
+    font-size: 16px;
+    color: #f3f4f6;
+}
+
+.drums-editor-host {
+    min-height: 4rem;
+}
