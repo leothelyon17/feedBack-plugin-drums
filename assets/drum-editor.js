@@ -1,7 +1,7 @@
 // INIT-003/SPEC-012: shared Drum editor factory.
 // Settings and pause call the same mount; only one instance is live.
-// Drums tab = named profile + attach MIDI device + lanes.
-// Mapping/knobs/Learn live on Settings → MIDI (feedBack.midiDevices).
+// Drums tab = Profiles (name, attach device, lane map, make active)
+// plus 2D-only highway options. Mapping/knobs/Learn live on MIDI.
 // Profile writes prefer window.feedBack.drumProfiles (SPEC-004) and
 // fall back to SPEC-002 HTTP so switching later is a one-function change.
 (function (root) {
@@ -9,13 +9,36 @@
 
 var PROFILE_ID_RE = /^[a-z0-9-]+$/;
 var DEVICE_ID_RE = /^[a-z0-9-]+$/;
+var TRIGGER_ID_RE = /^[a-z0-9_]+$/;
 var CONTEXTS = { settings: true, pause: true };
 var LEARN_LOCK_MSG = 'Learn is locked while a song is playing or paused. Mapping was not changed.';
 var MIDI_UNAVAILABLE_MSG = 'MIDI devices are unavailable. Highway still plays.';
+var NO_DEVICE_LANES_MSG = 'Attach a MIDI device to add lanes from its pads.';
+var NO_PADS_LANES_MSG = 'This device has no pads. Add triggers on Settings → MIDI.';
+var GET_FAILED_LANES_MSG = 'Could not load pads for this device.';
+var _DEFAULT_3D = {
+    palette: 'default',
+    camera_angle: 0.35,
+    theme: 'default',
+    fx: {},
+    lanes: [],
+    fallbacks: {},
+};
 
 var _mount = null;
-var _cache = { profiles: [], activeId: '', active: null, devices: [], midiAvailable: false };
+var _cache = {
+    profiles: [],
+    activeId: '',
+    active: null,
+    selectedId: '',
+    selected: null,
+    devices: [],
+    midiAvailable: false,
+    attachedDevice: null,
+    attachedLoadError: '',
+};
 var _persistSeq = 0;
+var _attachLoadSeq = 0;
 var _midiListUnsub = null;
 
 function _fb() {
@@ -236,20 +259,138 @@ function _live(root, msg) {
 
 function _mergeHighway(existing, patch) {
     var hw = existing && typeof existing === 'object' ? existing : {};
-    var next = {
+    var patchHw = (patch && typeof patch === 'object') ? patch : {};
+    return {
         '2d': Object.assign(
             { lane_preset: 'phase_shift_8', show_lane_labels: true },
             hw['2d'] || {},
-            (patch && patch['2d']) || {}
+            patchHw['2d'] || {}
         ),
+        '3d': Object.assign({}, _DEFAULT_3D, hw['3d'] || {}, patchHw['3d'] || {}),
     };
-    if (hw['3d']) next['3d'] = hw['3d'];
-    if (patch && patch['3d']) next['3d'] = patch['3d'];
-    return next;
+}
+
+function pieceIdOk(raw) {
+    return typeof raw === 'string' && TRIGGER_ID_RE.test(raw)
+        && raw !== '__proto__' && raw !== 'constructor' && raw !== 'prototype';
+}
+
+function lanesFromProfile(profile) {
+    var three = profile && profile.highway && profile.highway['3d'];
+    var raw = three && Array.isArray(three.lanes) ? three.lanes : [];
+    var out = [];
+    var seen = Object.create(null);
+    raw.forEach(function (ln) {
+        var piece = ln && typeof ln.piece === 'string' ? ln.piece : '';
+        if (!pieceIdOk(piece) || seen[piece]) return;
+        seen[piece] = true;
+        out.push({ piece: piece });
+    });
+    return out;
+}
+
+function triggerPool(device) {
+    var list = device && Array.isArray(device.triggers) ? device.triggers : [];
+    var out = [];
+    var seen = Object.create(null);
+    list.forEach(function (t) {
+        var id = t && typeof t.id === 'string' ? t.id : '';
+        if (!pieceIdOk(id) || seen[id]) return;
+        seen[id] = true;
+        var name = (t && typeof t.name === 'string' && t.name.trim()) ? t.name.trim() : id;
+        out.push({ id: id, name: name });
+    });
+    return out;
+}
+
+function _usableTriggerCount(device) {
+    return triggerPool(device).length;
+}
+
+function _deviceTypeId(device) {
+    var raw = device && device.device_type_id != null ? String(device.device_type_id) : '';
+    return DEVICE_ID_RE.test(raw) ? raw : '';
+}
+
+function _typesList(raw) {
+    if (Array.isArray(raw)) return raw;
+    if (raw && Array.isArray(raw.device_types)) return raw.device_types;
+    return [];
+}
+
+// Settings → MIDI draws Kick/Snare from the type catalog when device.triggers
+// is missing. Live GET/list omit that key, so the attach pool must do the same.
+async function _loadTypeTriggers(typeId) {
+    if (!typeId) return { ok: false, triggers: [] };
+    var api = _midiDevices();
+    if (api && typeof api.listTypes === 'function') {
+        try {
+            var types = _typesList(await api.listTypes.call(api));
+            var found = null;
+            for (var i = 0; i < types.length; i += 1) {
+                if (types[i] && types[i].id === typeId) {
+                    found = types[i];
+                    break;
+                }
+            }
+            var fromList = found && Array.isArray(found.triggers) ? found.triggers : [];
+            return { ok: true, triggers: fromList };
+        } catch (_) {
+            return { ok: false, triggers: [] };
+        }
+    }
+    if (typeof fetch === 'function') {
+        try {
+            var res = await fetch('/api/midi/device-types/' + encodeURIComponent(typeId));
+            if (!res || !res.ok) return { ok: false, triggers: [] };
+            var body = await res.json();
+            if (!body || body.id !== typeId) return { ok: false, triggers: [] };
+            var fromGet = Array.isArray(body.triggers) ? body.triggers : [];
+            return { ok: true, triggers: fromGet };
+        } catch (_) {
+            return { ok: false, triggers: [] };
+        }
+    }
+    return { ok: false, triggers: [] };
+}
+
+function _wantedDeviceId() {
+    var fromSel = '';
+    if (_mount && _mount.root) {
+        var sel = _mount.root.querySelector('.drums-attach-select');
+        if (sel && typeof sel.value === 'string') fromSel = normalizeDeviceId(sel.value);
+    }
+    if (fromSel) return fromSel;
+    return _cache.selected ? normalizeDeviceId(_cache.selected.device_id) : '';
+}
+
+function _unwrapMidiDevice(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    if (raw.device && typeof raw.device === 'object' && !Array.isArray(raw.device)
+        && Array.isArray(raw.device.triggers) && !Array.isArray(raw.triggers)) {
+        return raw.device;
+    }
+    return raw;
+}
+
+function _triggerName(pool, piece) {
+    var i;
+    for (i = 0; i < pool.length; i++) {
+        if (pool[i].id === piece) return pool[i].name;
+    }
+    return piece;
+}
+
+function _editingProfile() {
+    return _cache.selected || _cache.active;
+}
+
+function _editingProfileId() {
+    return _cache.selectedId || _cache.activeId || '';
 }
 
 function _profileFromForm(name, id, patch) {
-    var base = _cache.active || {};
+    var base = _editingProfile() || {};
     var deviceId = Object.prototype.hasOwnProperty.call(patch || {}, 'device_id')
         ? normalizeDeviceId(patch.device_id)
         : normalizeDeviceId(base.device_id);
@@ -277,8 +418,20 @@ async function refreshProfiles() {
     if (!_cache.active && _cache.activeId) {
         _cache.active = await getProfile(_cache.activeId);
     }
+    if (!_cache.selectedId || !_cache.profiles.some(function (p) { return p.id === _cache.selectedId; })) {
+        _cache.selectedId = _cache.activeId;
+    }
+    _cache.selected = _cache.profiles.find(function (p) { return p.id === _cache.selectedId; }) || null;
+    if (!_cache.selected && _cache.selectedId) {
+        _cache.selected = await getProfile(_cache.selectedId);
+    }
     _fillProfileSelect();
     _fillAttachSelect();
+    _fill2dControls();
+    _updateActivateButton();
+    await _loadAttachedDevice(_wantedDeviceId());
+    _fillLaneGrid();
+    await _maybeSeedLanesFrom3dKit();
     return _cache;
 }
 
@@ -286,7 +439,7 @@ function _fillProfileSelect() {
     if (!_mount || !_mount.root) return;
     var sel = _mount.root.querySelector('.drums-profile-select');
     if (!sel) return;
-    var keep = _cache.activeId;
+    var keep = _cache.selectedId || _cache.activeId;
     sel.textContent = '';
     var empty = _doc().createElement('option');
     empty.value = '';
@@ -295,7 +448,9 @@ function _fillProfileSelect() {
     _cache.profiles.forEach(function (p) {
         var opt = _doc().createElement('option');
         opt.value = p.id;
-        opt.textContent = p.name || p.id;
+        var label = p.name || p.id;
+        if (p.id === _cache.activeId) label += ' (active)';
+        opt.textContent = label;
         if (p.id === keep) opt.selected = true;
         sel.appendChild(opt);
     });
@@ -326,7 +481,7 @@ function _fillAttachSelect() {
     if (!_mount || !_mount.root) return;
     var sel = _mount.root.querySelector('.drums-attach-select');
     if (!sel) return;
-    var keep = _cache.active ? normalizeDeviceId(_cache.active.device_id) : '';
+    var keep = _cache.selected ? normalizeDeviceId(_cache.selected.device_id) : '';
     var d = _doc();
     sel.textContent = '';
     var empty = d.createElement('option');
@@ -354,7 +509,12 @@ function _bindMidiDeviceList() {
     _unbindMidiDeviceList();
     var api = _midiDevices();
     var handler = function () {
-        listMidiDevices().then(_fillAttachSelect);
+        listMidiDevices().then(function () {
+            _fillAttachSelect();
+            return _loadAttachedDevice(_wantedDeviceId());
+        }).then(function (dev) {
+            _fillLaneGrid(dev);
+        });
     };
     var fb = _fb();
     var unsubs = [];
@@ -393,17 +553,27 @@ function _unbindMidiDeviceList() {
 }
 
 async function persistActivePatch(patch) {
-    if (!_cache.activeId || !PROFILE_ID_RE.test(_cache.activeId)) {
+    var id = _editingProfileId();
+    if (!id || !PROFILE_ID_RE.test(id)) {
         return { ok: false, skipped: true };
     }
     var seq = ++_persistSeq;
-    var current = _cache.active || await getProfile(_cache.activeId) || { id: _cache.activeId, name: _cache.activeId };
-    var next = _profileFromForm(current.name || current.id, _cache.activeId, patch || {});
+    var current = _editingProfile() || await getProfile(id) || { id: id, name: id };
+    var next = _profileFromForm(current.name || current.id, id, patch || {});
     var res = await saveProfile(next);
     if (seq !== _persistSeq) return { ok: false, stale: true };
     if (res.ok) {
-        _cache.active = res.data || next;
-        _live(_mount && _mount.root, 'Saved ' + (_cache.active.name || _cache.active.id) + '.');
+        var stored = res.data || next;
+        if (stored && typeof stored === 'object') {
+            stored.device_id = next.device_id;
+            if (next.highway) stored.highway = next.highway;
+        }
+        _cache.selected = stored;
+        _cache.selectedId = id;
+        if (id === _cache.activeId) _cache.active = _cache.selected;
+        var idx = _cache.profiles.findIndex(function (p) { return p.id === id; });
+        if (idx >= 0) _cache.profiles[idx] = _cache.selected;
+        _live(_mount && _mount.root, 'Saved ' + (_cache.selected.name || _cache.selected.id) + '.');
     } else {
         _live(_mount && _mount.root, 'Could not save profile.');
     }
@@ -442,24 +612,27 @@ async function _submitNameForm() {
         return;
     }
     if (mode === 'rename') {
-        if (!_cache.activeId) {
+        var renameId = _editingProfileId();
+        if (!renameId) {
             _live(_mount.root, 'Select a profile to rename.');
             return;
         }
-        var renamed = _profileFromForm(name, _cache.activeId, {});
+        var renamed = _profileFromForm(name, renameId, {});
         var saved = await saveProfile(renamed);
         if (!saved.ok) {
             _live(_mount.root, 'Could not rename profile.');
             return;
         }
-        _cache.active = saved.data || renamed;
+        _cache.selected = saved.data || renamed;
+        _cache.selectedId = renameId;
+        if (renameId === _cache.activeId) _cache.active = _cache.selected;
         await refreshProfiles();
         _hideNameForm();
         _live(_mount.root, 'Renamed to ' + name + '.');
         return;
     }
     var id = uniqueProfileId(slugifyName(name), _cache.profiles);
-    var src = mode === 'duplicate' && _cache.active ? _cache.active : {};
+    var src = mode === 'duplicate' && _editingProfile() ? _editingProfile() : {};
     var created = {
         id: id,
         name: name,
@@ -478,32 +651,59 @@ async function _submitNameForm() {
         return;
     }
     _cache.profiles.push(put.data || created);
-    var act = await activateProfile(id);
-    if (!act.ok) {
-        _live(_mount.root, 'Created, but could not activate.');
-        await refreshProfiles();
-        _hideNameForm();
-        return;
+    _cache.selectedId = id;
+    _cache.selected = put.data || created;
+    if (!_cache.activeId) {
+        var act = await activateProfile(id);
+        if (act.ok) {
+            _cache.activeId = id;
+            _cache.active = _cache.selected;
+        }
     }
-    _cache.activeId = id;
-    _cache.active = put.data || created;
     await refreshProfiles();
     _hideNameForm();
-    _live(_mount.root, (mode === 'duplicate' ? 'Duplicated as ' : 'Created ') + name + '.');
+    var verb = mode === 'duplicate' ? 'Duplicated as ' : 'Created ';
+    if (_cache.activeId === id) {
+        _live(_mount.root, verb + name + '.');
+    } else {
+        _live(_mount.root, verb + name + '. Make active to use it for play.');
+    }
 }
 
 async function _onSelectProfile(id) {
     if (!id) return;
+    _cache.selectedId = id;
+    _cache.selected = _cache.profiles.find(function (p) { return p.id === id; }) || await getProfile(id);
+    _fillProfileSelect();
+    _fillAttachSelect();
+    _fill2dControls();
+    _updateActivateButton();
+    await _loadAttachedDevice(_wantedDeviceId());
+    _fillLaneGrid();
+    var name = (_cache.selected && _cache.selected.name) || id;
+    if (id === _cache.activeId) {
+        _live(_mount && _mount.root, 'Editing active profile ' + name + '.');
+    } else {
+        _live(_mount && _mount.root, 'Editing ' + name + '. Make active to use it for play.');
+    }
+}
+
+async function _onMakeActive() {
+    var id = _editingProfileId();
+    if (!id) {
+        _live(_mount && _mount.root, 'Select a profile to make active.');
+        return;
+    }
     var act = await activateProfile(id);
     if (!act.ok) {
         _live(_mount && _mount.root, 'Could not activate profile.');
         return;
     }
     _cache.activeId = id;
-    _cache.active = _cache.profiles.find(function (p) { return p.id === id; }) || await getProfile(id);
+    _cache.active = _cache.selected || _cache.profiles.find(function (p) { return p.id === id; }) || await getProfile(id);
     _fillProfileSelect();
-    _fillAttachSelect();
-    _live(_mount && _mount.root, 'Activated ' + ((_cache.active && _cache.active.name) || id) + '.');
+    _updateActivateButton();
+    _live(_mount && _mount.root, 'Active profile: ' + ((_cache.active && _cache.active.name) || id) + '.');
 }
 
 async function _onAttachDevice(id) {
@@ -515,6 +715,8 @@ async function _onAttachDevice(id) {
     var res = await persistActivePatch({ device_id: deviceId });
     if (res && res.ok) {
         _fillAttachSelect();
+        var attached = await _loadAttachedDevice(deviceId);
+        _fillLaneGrid(attached);
         _live(_mount && _mount.root, deviceId
             ? 'Attached MIDI device.'
             : 'No MIDI device attached. Hits stay unmapped.');
@@ -522,7 +724,8 @@ async function _onAttachDevice(id) {
 }
 
 async function _onDeleteProfile() {
-    if (!_cache.activeId) {
+    var doomed = _editingProfileId();
+    if (!doomed) {
         _live(_mount && _mount.root, 'Select a profile to delete.');
         return;
     }
@@ -530,25 +733,281 @@ async function _onDeleteProfile() {
         _live(_mount && _mount.root, 'Create another profile before deleting this one.');
         return;
     }
-    var doomed = _cache.activeId;
     var other = _cache.profiles.find(function (p) { return p.id !== doomed; });
     if (!other) {
         _live(_mount && _mount.root, 'Create another profile before deleting this one.');
         return;
     }
-    var act = await activateProfile(other.id);
-    if (!act.ok) {
-        _live(_mount && _mount.root, 'Activate another profile before deleting.');
-        return;
+    if (doomed === _cache.activeId) {
+        var act = await activateProfile(other.id);
+        if (!act.ok) {
+            _live(_mount && _mount.root, 'Activate another profile before deleting.');
+            return;
+        }
+        _cache.activeId = other.id;
     }
     var del = await deleteProfile(doomed);
     if (!del.ok) {
         _live(_mount && _mount.root, del.detail || 'Could not delete profile.');
         return;
     }
-    _cache.activeId = other.id;
+    _cache.selectedId = other.id;
     await refreshProfiles();
     _live(_mount && _mount.root, 'Deleted profile.');
+}
+
+async function _loadAttachedDevice(deviceId) {
+    var id = normalizeDeviceId(deviceId);
+    if (!id) id = _wantedDeviceId();
+    var seq = ++_attachLoadSeq;
+    if (!id) {
+        _cache.attachedDevice = null;
+        _cache.attachedLoadError = '';
+        return null;
+    }
+    var fromList = _cache.devices.find(function (d) { return d.id === id; }) || null;
+    var api = _midiDevices();
+    var got = null;
+    var getFailed = false;
+    var needGet = !_usableTriggerCount(fromList);
+    if (needGet && api && typeof api.get === 'function') {
+        try {
+            got = _unwrapMidiDevice(await api.get.call(api, id));
+        } catch (_) {
+            getFailed = true;
+        }
+    }
+    if (seq !== _attachLoadSeq) return _cache.attachedDevice;
+
+    var prev = _cache.attachedDevice;
+    var prevOk = prev && prev.id === id && _usableTriggerCount(prev);
+    var candidate = null;
+    if (_usableTriggerCount(got)) candidate = got;
+    else if (_usableTriggerCount(fromList)) candidate = fromList;
+    else if (prevOk) {
+        _cache.attachedLoadError = '';
+        return prev;
+    } else {
+        candidate = got || fromList || { id: id, triggers: [] };
+    }
+
+    var typeFailed = false;
+    if (!_usableTriggerCount(candidate)) {
+        var typeId = _deviceTypeId(candidate) || _deviceTypeId(got) || _deviceTypeId(fromList);
+        if (typeId) {
+            var cat = await _loadTypeTriggers(typeId);
+            if (seq !== _attachLoadSeq) return _cache.attachedDevice;
+            if (!cat.ok) typeFailed = true;
+            else if (_usableTriggerCount({ triggers: cat.triggers })) {
+                candidate = Object.assign({}, candidate, { triggers: cat.triggers });
+            }
+        }
+    }
+
+    _cache.attachedDevice = candidate;
+    if (_usableTriggerCount(candidate)) {
+        _cache.attachedLoadError = '';
+    } else if (getFailed || typeFailed) {
+        _cache.attachedLoadError = 'get-failed';
+    } else {
+        _cache.attachedLoadError = 'empty-triggers';
+    }
+    return _cache.attachedDevice;
+}
+
+function _fill2dControls() {
+    if (!_mount || !_mount.root) return;
+    var profile = _editingProfile();
+    var two = profile && profile.highway && profile.highway['2d'] ? profile.highway['2d'] : {};
+    var preset = two.lane_preset === 'rb4' ? 'rb4' : 'phase_shift_8';
+    var sel = _mount.root.querySelector('.drums-lane-preset');
+    if (sel) sel.value = preset;
+    var chk = _mount.root.querySelector('.drums-chk-labels');
+    if (chk) chk.checked = two.show_lane_labels !== false;
+}
+
+function _updateActivateButton() {
+    if (!_mount || !_mount.root) return;
+    var btn = _mount.root.querySelector('.drums-profile-activate');
+    var status = _mount.root.querySelector('.drums-profile-active-status');
+    var selectedId = _editingProfileId();
+    var canActivate = !!(selectedId && selectedId !== _cache.activeId);
+    if (btn) {
+        btn.disabled = !canActivate;
+        if (canActivate) btn.removeAttribute('aria-disabled');
+        else btn.setAttribute('aria-disabled', 'true');
+    }
+    if (status) {
+        status.textContent = _cache.activeId
+            ? ('Active profile: ' + ((_cache.active && _cache.active.name) || _cache.activeId)
+                + (selectedId && selectedId !== _cache.activeId
+                    ? ' · editing ' + ((_cache.selected && _cache.selected.name) || selectedId)
+                    : ''))
+            : 'No profile active.';
+    }
+}
+
+function _fillLaneGrid(device) {
+    if (!_mount || !_mount.root) return;
+    var list = _mount.root.querySelector('.drums-lane-list');
+    var addSel = _mount.root.querySelector('.drums-lane-add');
+    var hint = _mount.root.querySelector('.drums-lane-hint');
+    if (!list) return;
+    var d = _doc();
+    list.textContent = '';
+    var wanted = _wantedDeviceId();
+    var src = (device && typeof device === 'object' && !Array.isArray(device)
+        && (device.id || Array.isArray(device.triggers)))
+        ? device
+        : _cache.attachedDevice;
+    if (wanted && (!src || (src.id && src.id !== wanted))
+        && _cache.attachedDevice && _cache.attachedDevice.id === wanted) {
+        src = _cache.attachedDevice;
+    }
+    if (!wanted) src = null;
+    var pool = triggerPool(src);
+    var lanes = lanesFromProfile(_editingProfile());
+    var taken = Object.create(null);
+    var unused = 0;
+    lanes.forEach(function (ln, i) {
+        taken[ln.piece] = true;
+        var row = d.createElement('div');
+        row.className = 'drums-lane-row';
+        var idx = d.createElement('span');
+        idx.className = 'drums-lane-idx';
+        idx.textContent = String(i);
+        var name = d.createElement('span');
+        name.className = 'drums-lane-name';
+        name.textContent = _triggerName(pool, ln.piece);
+        var up = d.createElement('button');
+        up.type = 'button';
+        up.className = 'drums-lane-up';
+        up.dataset.act = 'up';
+        up.dataset.i = String(i);
+        up.textContent = '▲';
+        up.disabled = i === 0;
+        up.setAttribute('aria-label', 'Move ' + name.textContent + ' up');
+        var down = d.createElement('button');
+        down.type = 'button';
+        down.className = 'drums-lane-down';
+        down.dataset.act = 'down';
+        down.dataset.i = String(i);
+        down.textContent = '▼';
+        down.disabled = i === lanes.length - 1;
+        down.setAttribute('aria-label', 'Move ' + name.textContent + ' down');
+        var rm = d.createElement('button');
+        rm.type = 'button';
+        rm.className = 'drums-lane-rm';
+        rm.dataset.act = 'rm';
+        rm.dataset.i = String(i);
+        rm.textContent = '✗';
+        rm.setAttribute('aria-label', 'Remove ' + name.textContent);
+        row.appendChild(idx);
+        row.appendChild(name);
+        row.appendChild(up);
+        row.appendChild(down);
+        row.appendChild(rm);
+        list.appendChild(row);
+    });
+    pool.forEach(function (t) {
+        if (!taken[t.id]) unused += 1;
+    });
+    if (addSel) {
+        addSel.textContent = '';
+        var empty = d.createElement('option');
+        empty.value = '';
+        if (!wanted) empty.textContent = '— attach a device first —';
+        else if (!pool.length && _cache.attachedLoadError === 'get-failed') {
+            empty.textContent = '— could not load pads —';
+        } else if (!pool.length) {
+            empty.textContent = '— no pads on this device —';
+        } else {
+            empty.textContent = '— pick a piece to add —';
+        }
+        addSel.appendChild(empty);
+        pool.forEach(function (t) {
+            if (taken[t.id]) return;
+            var opt = d.createElement('option');
+            opt.value = t.id;
+            opt.textContent = t.name;
+            addSel.appendChild(opt);
+        });
+        addSel.disabled = unused === 0;
+    }
+    if (hint) {
+        if (pool.length) hint.textContent = '';
+        else if (!wanted) hint.textContent = NO_DEVICE_LANES_MSG;
+        else if (_cache.attachedLoadError === 'get-failed') hint.textContent = GET_FAILED_LANES_MSG;
+        else hint.textContent = NO_PADS_LANES_MSG;
+    }
+}
+
+async function _maybeSeedLanesFrom3dKit() {
+    var profile = _editingProfile();
+    if (!profile || lanesFromProfile(profile).length) return;
+    var pool = triggerPool(_cache.attachedDevice);
+    if (!pool.length) return;
+    var allowed = Object.create(null);
+    pool.forEach(function (t) { allowed[t.id] = true; });
+    var kit = (typeof window !== 'undefined' && window.drumH3dGetKit)
+        ? window.drumH3dGetKit()
+        : null;
+    if (!kit || !Array.isArray(kit.lanes) || !kit.lanes.length) return;
+    var seed = [];
+    kit.lanes.forEach(function (ln) {
+        var piece = ln && ln.piece;
+        if (!allowed[piece]) return;
+        if (seed.some(function (s) { return s.piece === piece; })) return;
+        seed.push({ piece: piece });
+    });
+    if (!seed.length) return;
+    await _persistLanes(seed);
+}
+
+async function _persistLanes(nextLanes) {
+    var current = lanesFromProfile(_editingProfile());
+    var three = ((_editingProfile() || {}).highway || {})['3d'] || {};
+    var res = await persistActivePatch({
+        highway: {
+            '3d': Object.assign({}, three, { lanes: nextLanes || current }),
+        },
+    });
+    if (res && res.ok) _fillLaneGrid();
+    return res;
+}
+
+async function addLane(pieceId) {
+    if (!pieceIdOk(pieceId)) return { ok: false };
+    var pool = triggerPool(_cache.attachedDevice);
+    var allowed = pool.some(function (t) { return t.id === pieceId; });
+    if (!allowed) return { ok: false, reason: 'not-in-pool' };
+    var lanes = lanesFromProfile(_editingProfile());
+    if (lanes.some(function (ln) { return ln.piece === pieceId; })) {
+        return { ok: false, reason: 'duplicate' };
+    }
+    lanes.push({ piece: pieceId });
+    return _persistLanes(lanes);
+}
+
+async function moveLane(index, dir) {
+    var lanes = lanesFromProfile(_editingProfile());
+    var i = Number(index);
+    var j = dir === 'up' ? i - 1 : i + 1;
+    if (i < 0 || i >= lanes.length || j < 0 || j >= lanes.length) {
+        return { ok: false, reason: 'bounds' };
+    }
+    var tmp = lanes[i];
+    lanes[i] = lanes[j];
+    lanes[j] = tmp;
+    return _persistLanes(lanes);
+}
+
+async function removeLane(index) {
+    var lanes = lanesFromProfile(_editingProfile());
+    var i = Number(index);
+    if (i < 0 || i >= lanes.length) return { ok: false, reason: 'bounds' };
+    lanes.splice(i, 1);
+    return _persistLanes(lanes);
 }
 
 function _editorHtml(opts) {
@@ -556,16 +1015,18 @@ function _editorHtml(opts) {
     var preset = opts.lanePreset === 'rb4' ? 'rb4' : 'phase_shift_8';
     return (
         '<div class="drums-editor-chrome">' +
+            '<p class="drums-profile-active-status">No profile active.</p>' +
             '<div class="drums-editor-chrome-row">' +
                 '<label class="drums-editor-field">' +
                     '<span>Profile</span>' +
-                    '<select class="drums-profile-select" aria-label="Active drum profile"></select>' +
+                    '<select class="drums-profile-select" aria-label="Drum profile"></select>' +
                 '</label>' +
                 '<div class="drums-editor-chrome-actions">' +
                     '<button type="button" class="drums-profile-create">Create</button>' +
                     '<button type="button" class="drums-profile-rename">Rename</button>' +
                     '<button type="button" class="drums-profile-duplicate">Duplicate</button>' +
                     '<button type="button" class="drums-profile-delete">Delete</button>' +
+                    '<button type="button" class="drums-profile-activate" disabled aria-disabled="true">Make active</button>' +
                 '</div>' +
             '</div>' +
             '<form class="drums-editor-name-form" hidden>' +
@@ -587,12 +1048,23 @@ function _editorHtml(opts) {
                 '</label>' +
             '</div>' +
         '</section>' +
-        '<section class="drums-editor-section" data-drums-section="highway" aria-labelledby="drums-editor-highway-h">' +
-            '<h3 id="drums-editor-highway-h">Highway</h3>' +
+        '<section class="drums-editor-section" data-drums-section="lanes" aria-labelledby="drums-editor-lanes-h">' +
+            '<h3 id="drums-editor-lanes-h">Lanes</h3>' +
+            '<p class="drums-lane-copy">Left → right on the highway. The add list is the attached device\'s pads; you do not have to use every pad. Kick is a full-width bar on 3D.</p>' +
+            '<p class="drums-lane-hint" role="status"></p>' +
+            '<div class="drums-lane-list"></div>' +
+            '<label class="drums-editor-field drums-editor-field--grow">' +
+                '<span>Add a piece</span>' +
+                '<select class="drums-lane-add" aria-label="Add a piece"></select>' +
+            '</label>' +
+        '</section>' +
+        '<details class="drums-2d-highway" data-drums-section="highway">' +
+            '<summary class="drums-2d-highway-summary">2D Drum Highway</summary>' +
+            '<p class="drums-lane-copy">Visual preset for the 2D highway only. Independent of the profile piece list above.</p>' +
             '<div class="drums-editor-row">' +
                 '<label class="drums-editor-field">' +
                     '<span>Lanes</span>' +
-                    '<select class="drums-lane-preset" aria-label="Lane preset">' +
+                    '<select class="drums-lane-preset" aria-label="2D lane preset">' +
                         '<option value="phase_shift_8"' + (preset === 'phase_shift_8' ? ' selected' : '') + '>Phase Shift 8</option>' +
                         '<option value="rb4"' + (preset === 'rb4' ? ' selected' : '') + '>Rock Band</option>' +
                     '</select>' +
@@ -602,7 +1074,7 @@ function _editorHtml(opts) {
                     '<span>Labels</span>' +
                 '</label>' +
             '</div>' +
-        '</section>'
+        '</details>'
     );
 }
 
@@ -614,15 +1086,21 @@ function _wireChrome(root) {
         _showNameForm('create', '');
     };
     root.querySelector('.drums-profile-rename').onclick = function () {
-        var preset = (_cache.active && _cache.active.name) || '';
+        var editing = _editingProfile();
+        var preset = (editing && editing.name) || '';
         _showNameForm('rename', preset);
     };
     root.querySelector('.drums-profile-duplicate').onclick = function () {
-        var base = (_cache.active && _cache.active.name) ? (_cache.active.name + ' copy') : '';
+        var editing = _editingProfile();
+        var base = (editing && editing.name) ? (editing.name + ' copy') : '';
         _showNameForm('duplicate', base);
     };
     root.querySelector('.drums-profile-delete').onclick = function () {
         _onDeleteProfile();
+    };
+    var activate = root.querySelector('.drums-profile-activate');
+    if (activate) {
+        activate.onclick = function () { _onMakeActive(); };
     };
     var form = root.querySelector('.drums-editor-name-form');
     form.onsubmit = function (ev) {
@@ -636,6 +1114,27 @@ function _wireChrome(root) {
     if (attach) {
         attach.onchange = function () {
             _onAttachDevice(this.value);
+        };
+    }
+    var addSel = root.querySelector('.drums-lane-add');
+    if (addSel) {
+        addSel.onchange = function () {
+            var piece = this.value;
+            this.value = '';
+            if (piece) addLane(piece);
+        };
+    }
+    var list = root.querySelector('.drums-lane-list');
+    if (list) {
+        list.onclick = function (ev) {
+            var t = ev && ev.target;
+            while (t && t !== list && !(t.dataset && t.dataset.act)) t = t.parentNode;
+            if (!t || t === list) return;
+            var i = t.dataset.i;
+            var act = t.dataset.act;
+            if (act === 'up') moveLane(i, 'up');
+            else if (act === 'down') moveLane(i, 'down');
+            else if (act === 'rm') removeLane(i);
         };
     }
 }
@@ -675,7 +1174,8 @@ function mountDrumEditor(host, opts) {
     refreshProfiles();
     listMidiDevices().then(function () {
         _fillAttachSelect();
-    });
+        return _loadAttachedDevice(_wantedDeviceId());
+    }).then(function (dev) { _fillLaneGrid(dev); });
     _bindMidiDeviceList();
     if (typeof opts.onMounted === 'function') opts.onMounted(root, { context: context });
     return { ok: true, context: context, root: root };
@@ -749,8 +1249,19 @@ function openPauseDrumEditor(opts) {
 
 function resetForTests() {
     unmountDrumEditor();
-    _cache = { profiles: [], activeId: '', active: null, devices: [], midiAvailable: false };
+    _cache = {
+        profiles: [],
+        activeId: '',
+        active: null,
+        selectedId: '',
+        selected: null,
+        devices: [],
+        midiAvailable: false,
+        attachedDevice: null,
+        attachedLoadError: '',
+    };
     _persistSeq = 0;
+    _attachLoadSeq = 0;
 }
 
 var api = {
@@ -768,6 +1279,12 @@ var api = {
     slugifyName: slugifyName,
     uniqueProfileId: uniqueProfileId,
     normalizeDeviceId: normalizeDeviceId,
+    pieceIdOk: pieceIdOk,
+    lanesFromProfile: lanesFromProfile,
+    triggerPool: triggerPool,
+    addLane: addLane,
+    moveLane: moveLane,
+    removeLane: removeLane,
     learnLockMessage: learnLockMessage,
     isLearnLockedStatus: isLearnLockedStatus,
     resetForTests: resetForTests,

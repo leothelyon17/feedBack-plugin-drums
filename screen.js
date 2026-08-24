@@ -60,7 +60,7 @@ function _ensureDrumEditor(cb) {
     if (!_editorLoadPromise) {
         _editorLoadPromise = new Promise(function (resolve) {
             const s = document.createElement('script');
-            s.src = '/api/plugins/drums/assets/drum-editor.js';
+            s.src = '/api/plugins/drums/assets/drum-editor.js?v=type-pool-1';
             s.onload = function () { resolve(window.feedBackDrumsEditor || null); };
             s.onerror = function () { resolve(null); };
             (document.head || document.documentElement).appendChild(s);
@@ -1961,7 +1961,6 @@ function _wireKitControls(scope) {
 
 function _collectProfilePatch() {
     return {
-        device_id: _attachedDeviceId || '',
         highway: {
             '2d': {
                 lane_preset: _cfg.lanePreset,
@@ -2059,15 +2058,12 @@ function _onDrumProfileChange(ev) {
     const apply = function (profile) {
         if (profile) _applyDrumProfile(profile);
     };
+    // Do not refreshProfiles() here: that rebuilds the Attach select and
+    // races the in-flight save (flash back to None). Scoring overlay only.
     if (editor && typeof editor.listProfiles === 'function' && detail.profile_id) {
         editor.listProfiles().then(function (list) {
             const hit = (list || []).find(function (p) { return p.id === detail.profile_id; });
-            if (hit) apply(hit);
-            else if (typeof editor.refreshProfiles === 'function') {
-                editor.refreshProfiles().then(function (cache) {
-                    apply(cache && cache.active);
-                });
-            }
+            apply(hit);
         });
         return;
     }

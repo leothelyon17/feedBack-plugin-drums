@@ -3,20 +3,26 @@
 .drums-editor {
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 8px;
     color: #d1d5db;
     font-family: system-ui, sans-serif;
     font-size: 13px;
+}
+
+.drums-editor-chrome,
+.drums-editor-section,
+.drums-2d-highway {
+    position: relative;
+    background: rgba(17, 24, 39, 0.96);
+    border: 1px solid #1f2937;
+    border-radius: 8px;
+    padding: 10px 12px;
 }
 
 .drums-editor-chrome {
     position: sticky;
     top: 0;
     z-index: 2;
-    background: rgba(17, 24, 39, 0.96);
-    border: 1px solid #1f2937;
-    border-radius: 8px;
-    padding: 8px 10px;
 }
 
 .drums-editor-chrome-row,
@@ -96,9 +102,14 @@
 .drums-editor-live,
 .drums-map-status,
 .drums-kit-suggest {
-    min-height: 1.2em;
+    min-height: 0;
     font-size: 11px;
     color: #d1d5db;
+    margin: 6px 0 0;
+}
+
+.drums-editor-live:empty {
+    display: none;
     margin: 0;
 }
 
@@ -157,4 +168,70 @@
 
 .drums-editor-host {
     min-height: 4rem;
+}
+
+.drums-profile-active-status {
+    margin: 0 0 6px;
+    font-size: 11px;
+    color: #9ca3af;
+}
+
+.drums-profile-activate {
+    background: #065f46;
+    border-color: #059669;
+    color: #ecfdf5;
+}
+
+.drums-lane-copy,
+.drums-lane-hint {
+    margin: 0 0 8px;
+    font-size: 11px;
+    color: #9ca3af;
+    line-height: 1.4;
+}
+
+.drums-lane-hint:empty {
+    display: none;
+    margin: 0;
+}
+
+.drums-lane-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-bottom: 8px;
+}
+
+.drums-lane-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px;
+    background: rgba(26, 26, 46, 0.7);
+    border-radius: 6px;
+}
+
+.drums-lane-idx {
+    font-family: ui-monospace, monospace;
+    font-size: 10px;
+    color: #6b7280;
+    width: 1.5rem;
+    text-align: center;
+}
+
+.drums-lane-name {
+    flex: 1;
+    color: #d1d5db;
+}
+
+.drums-lane-rm {
+    color: #f87171;
+}
+
+.drums-2d-highway-summary {
+    cursor: pointer;
+    font-size: 12px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #9ca3af;
 }
