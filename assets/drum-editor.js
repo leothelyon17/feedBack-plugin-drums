@@ -1,17 +1,22 @@
-// INIT-003/SPEC-005: shared Drum editor factory.
+// INIT-003/SPEC-012: shared Drum editor factory.
 // Settings and pause call the same mount; only one instance is live.
+// Drums tab = named profile + attach MIDI device + lanes.
+// Mapping/knobs/Learn live on Settings → MIDI (feedBack.midiDevices).
 // Profile writes prefer window.feedBack.drumProfiles (SPEC-004) and
 // fall back to SPEC-002 HTTP so switching later is a one-function change.
 (function (root) {
 'use strict';
 
 var PROFILE_ID_RE = /^[a-z0-9-]+$/;
+var DEVICE_ID_RE = /^[a-z0-9-]+$/;
 var CONTEXTS = { settings: true, pause: true };
 var LEARN_LOCK_MSG = 'Learn is locked while a song is playing or paused. Mapping was not changed.';
+var MIDI_UNAVAILABLE_MSG = 'MIDI devices are unavailable. Highway still plays.';
 
 var _mount = null;
-var _cache = { profiles: [], activeId: '', active: null };
+var _cache = { profiles: [], activeId: '', active: null, devices: [], midiAvailable: false };
 var _persistSeq = 0;
+var _midiListUnsub = null;
 
 function _fb() {
     if (typeof window === 'undefined') return null;
@@ -25,6 +30,19 @@ function _accessor() {
     var list = api.list || api.listProfiles;
     if (typeof list !== 'function') return null;
     return api;
+}
+
+function _midiDevices() {
+    var fb = _fb();
+    var api = fb && fb.midiDevices;
+    if (!api || typeof api !== 'object') return null;
+    if (typeof api.list !== 'function' && typeof api.get !== 'function') return null;
+    return api;
+}
+
+function normalizeDeviceId(raw) {
+    if (typeof raw !== 'string' || !raw) return '';
+    return DEVICE_ID_RE.test(raw) ? raw : '';
 }
 
 function _doc() {
@@ -121,14 +139,15 @@ async function getProfile(id) {
 
 async function saveProfile(profile) {
     if (!profile || typeof profile !== 'object') return { ok: false, status: 0, data: null };
+    var deviceId = normalizeDeviceId(profile.device_id);
     var body = {
         id: profile.id,
         name: profile.name,
         kit_id: profile.kit_id || '',
+        device_id: deviceId,
         device: {
-            source_id: profile.device && typeof profile.device.source_id === 'string'
-                ? profile.device.source_id : '',
-            enabled: Boolean(profile.device && profile.device.enabled),
+            source_id: '',
+            enabled: Boolean(deviceId),
         },
         input: profile.input || { midi_channel: -1, hit_detection: false, synth_volume: 0.7 },
         highway: profile.highway || { '2d': { lane_preset: 'phase_shift_8', show_lane_labels: true } },
@@ -137,6 +156,7 @@ async function saveProfile(profile) {
     var api = _accessor();
     if (api && typeof api.save === 'function') {
         var saved = await api.save.call(api, body);
+        if (saved) _emitProfileChange(saved);
         return { ok: Boolean(saved), status: saved ? 200 : 400, data: saved || null };
     }
     var id = typeof body.id === 'string' ? body.id : '';
@@ -200,6 +220,7 @@ function getMountedEditor() {
 function unmountDrumEditor() {
     if (!_mount) return;
     var onUnmounted = _mount.onUnmounted;
+    _unbindMidiDeviceList();
     if (_mount.root && _mount.root.parentNode) _mount.root.parentNode.removeChild(_mount.root);
     if (_mount.dialog && _mount.dialog.parentNode) _mount.dialog.parentNode.removeChild(_mount.dialog);
     if (_mount.hostRestore) _mount.hostRestore();
@@ -229,21 +250,21 @@ function _mergeHighway(existing, patch) {
 
 function _profileFromForm(name, id, patch) {
     var base = _cache.active || {};
+    var deviceId = Object.prototype.hasOwnProperty.call(patch || {}, 'device_id')
+        ? normalizeDeviceId(patch.device_id)
+        : normalizeDeviceId(base.device_id);
     return {
         id: id,
         name: name,
         kit_id: patch.kit_id != null ? patch.kit_id : (base.kit_id || ''),
+        device_id: deviceId,
         device: {
-            source_id: (patch.device && patch.device.source_id) ||
-                (base.device && base.device.source_id) || '',
-            enabled: patch.device && patch.device.enabled != null
-                ? Boolean(patch.device.enabled)
-                : Boolean(base.device && base.device.enabled),
+            source_id: '',
+            enabled: Boolean(deviceId),
         },
         input: Object.assign(
             { midi_channel: -1, hit_detection: false, synth_volume: 0.7 },
-            base.input || {},
-            patch.input || {}
+            base.input || {}
         ),
         highway: _mergeHighway(base.highway, patch.highway),
     };
@@ -257,6 +278,7 @@ async function refreshProfiles() {
         _cache.active = await getProfile(_cache.activeId);
     }
     _fillProfileSelect();
+    _fillAttachSelect();
     return _cache;
 }
 
@@ -278,6 +300,96 @@ function _fillProfileSelect() {
         sel.appendChild(opt);
     });
     if (keep) sel.value = keep;
+}
+
+async function listMidiDevices() {
+    var api = _midiDevices();
+    if (!api || typeof api.list !== 'function') {
+        _cache.midiAvailable = false;
+        _cache.devices = [];
+        return [];
+    }
+    _cache.midiAvailable = true;
+    try {
+        var raw = await api.list.call(api);
+        var list = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.devices) ? raw.devices : []);
+        _cache.devices = list.filter(function (d) {
+            return d && typeof d.id === 'string' && DEVICE_ID_RE.test(d.id);
+        });
+    } catch (_) {
+        _cache.devices = [];
+    }
+    return _cache.devices;
+}
+
+function _fillAttachSelect() {
+    if (!_mount || !_mount.root) return;
+    var sel = _mount.root.querySelector('.drums-attach-select');
+    if (!sel) return;
+    var keep = _cache.active ? normalizeDeviceId(_cache.active.device_id) : '';
+    var d = _doc();
+    sel.textContent = '';
+    var empty = d.createElement('option');
+    empty.value = '';
+    empty.textContent = _cache.midiAvailable ? 'None' : 'MIDI unavailable';
+    sel.appendChild(empty);
+    _cache.devices.forEach(function (dev) {
+        var opt = d.createElement('option');
+        opt.value = dev.id;
+        opt.textContent = (typeof dev.name === 'string' && dev.name) ? dev.name : dev.id;
+        if (dev.id === keep) opt.selected = true;
+        sel.appendChild(opt);
+    });
+    if (keep) sel.value = keep;
+    sel.disabled = !_cache.midiAvailable;
+    if (_cache.midiAvailable) {
+        sel.removeAttribute('aria-disabled');
+    } else {
+        sel.setAttribute('aria-disabled', 'true');
+        _live(_mount.root, MIDI_UNAVAILABLE_MSG);
+    }
+}
+
+function _bindMidiDeviceList() {
+    _unbindMidiDeviceList();
+    var api = _midiDevices();
+    var handler = function () {
+        listMidiDevices().then(_fillAttachSelect);
+    };
+    var fb = _fb();
+    var unsubs = [];
+    if (api && typeof api.subscribe === 'function') {
+        unsubs.push(api.subscribe(handler));
+    } else if (fb && typeof fb.on === 'function') {
+        fb.on('feedback:midi-device-change', handler);
+        unsubs.push(function () {
+            if (fb && typeof fb.off === 'function') fb.off('feedback:midi-device-change', handler);
+        });
+    }
+    var doc = _doc();
+    if (doc && typeof doc.addEventListener === 'function') {
+        doc.addEventListener('feedback:midi-device-change', handler);
+        unsubs.push(function () {
+            if (doc && typeof doc.removeEventListener === 'function') {
+                doc.removeEventListener('feedback:midi-device-change', handler);
+            }
+        });
+    }
+    _midiListUnsub = function () {
+        unsubs.forEach(function (fn) {
+            if (typeof fn === 'function') {
+                try { fn(); } catch (_) { /* best-effort */ }
+            }
+        });
+        _midiListUnsub = null;
+    };
+}
+
+function _unbindMidiDeviceList() {
+    if (typeof _midiListUnsub === 'function') {
+        try { _midiListUnsub(); } catch (_) { /* best-effort */ }
+        _midiListUnsub = null;
+    }
 }
 
 async function persistActivePatch(patch) {
@@ -352,9 +464,10 @@ async function _submitNameForm() {
         id: id,
         name: name,
         kit_id: src.kit_id || '',
+        device_id: normalizeDeviceId(src.device_id),
         device: {
-            source_id: (src.device && src.device.source_id) || '',
-            enabled: Boolean(src.device && src.device.enabled),
+            source_id: '',
+            enabled: Boolean(normalizeDeviceId(src.device_id)),
         },
         input: src.input || { midi_channel: -1, hit_detection: false, synth_volume: 0.7 },
         highway: _mergeHighway(src.highway, {}),
@@ -389,7 +502,23 @@ async function _onSelectProfile(id) {
     _cache.activeId = id;
     _cache.active = _cache.profiles.find(function (p) { return p.id === id; }) || await getProfile(id);
     _fillProfileSelect();
+    _fillAttachSelect();
     _live(_mount && _mount.root, 'Activated ' + ((_cache.active && _cache.active.name) || id) + '.');
+}
+
+async function _onAttachDevice(id) {
+    if (!_cache.midiAvailable) {
+        _live(_mount && _mount.root, MIDI_UNAVAILABLE_MSG);
+        return;
+    }
+    var deviceId = normalizeDeviceId(id);
+    var res = await persistActivePatch({ device_id: deviceId });
+    if (res && res.ok) {
+        _fillAttachSelect();
+        _live(_mount && _mount.root, deviceId
+            ? 'Attached MIDI device.'
+            : 'No MIDI device attached. Hits stay unmapped.');
+    }
 }
 
 async function _onDeleteProfile() {
@@ -422,21 +551,7 @@ async function _onDeleteProfile() {
     _live(_mount && _mount.root, 'Deleted profile.');
 }
 
-function _channelOptions(selected) {
-    var sel = selected == null ? -1 : selected;
-    var html = '<option value="-1"' + (sel === -1 ? ' selected' : '') + '>All</option>' +
-        '<option value="9"' + (sel === 9 ? ' selected' : '') + '>10 (Drums)</option>';
-    for (var i = 0; i < 16; i++) {
-        if (i === 9) continue;
-        html += '<option value="' + i + '"' + (sel === i ? ' selected' : '') + '>' + (i + 1) + '</option>';
-    }
-    return html;
-}
-
 function _editorHtml(opts) {
-    var vol = opts.synthVolume != null ? Math.round(opts.synthVolume * 100) : 70;
-    var ch = opts.midiChannel != null ? opts.midiChannel : -1;
-    var hits = opts.hitDetection ? ' checked' : '';
     var labels = opts.showLaneLabels !== false ? ' checked' : '';
     var preset = opts.lanePreset === 'rb4' ? 'rb4' : 'phase_shift_8';
     return (
@@ -463,41 +578,13 @@ function _editorHtml(opts) {
             '</form>' +
             '<p class="drums-editor-live" role="status" aria-live="polite"></p>' +
         '</div>' +
-        '<section class="drums-editor-section" data-drums-section="device" aria-labelledby="drums-editor-device-h">' +
-            '<h3 id="drums-editor-device-h">Device</h3>' +
+        '<section class="drums-editor-section" data-drums-section="attach" aria-labelledby="drums-editor-attach-h">' +
+            '<h3 id="drums-editor-attach-h">MIDI device</h3>' +
             '<div class="drums-editor-row">' +
                 '<label class="drums-editor-field">' +
-                    '<span>MIDI</span>' +
-                    '<select class="drums-midi-select" aria-label="MIDI device"><option value="">None</option></select>' +
+                    '<span>Attach</span>' +
+                    '<select class="drums-attach-select" aria-label="Attach MIDI device" disabled></select>' +
                 '</label>' +
-                '<label class="drums-editor-field">' +
-                    '<span>Vol</span>' +
-                    '<input type="range" class="drums-vol-slider" min="0" max="100" value="' + vol + '" aria-label="Drum synth volume">' +
-                '</label>' +
-                '<label class="drums-editor-field">' +
-                    '<span>Ch</span>' +
-                    '<select class="drums-channel-select" aria-label="MIDI channel">' + _channelOptions(ch) + '</select>' +
-                '</label>' +
-                '<label class="drums-editor-check">' +
-                    '<input type="checkbox" class="drums-chk-hits"' + hits + '>' +
-                    '<span>Hits</span>' +
-                '</label>' +
-            '</div>' +
-        '</section>' +
-        '<section class="drums-editor-section" data-drums-section="map" aria-labelledby="drums-editor-map-h">' +
-            '<h3 id="drums-editor-map-h">Map</h3>' +
-            '<div class="drums-editor-row">' +
-                '<label class="drums-editor-field">' +
-                    '<span>Kit</span>' +
-                    '<select class="drums-kit-select" aria-label="Drum kit"></select>' +
-                '</label>' +
-                '<button type="button" class="drums-kit-confirm" aria-label="Use this kit">Use this kit</button>' +
-                '<button type="button" class="drums-reset-map">Reset Map</button>' +
-            '</div>' +
-            '<div class="drums-kit-suggest" role="status" hidden></div>' +
-            '<div class="drums-map-status" role="status" aria-live="polite"></div>' +
-            '<div class="drums-editor-map-wrap">' +
-                '<table class="drums-map-table"></table>' +
             '</div>' +
         '</section>' +
         '<section class="drums-editor-section" data-drums-section="highway" aria-labelledby="drums-editor-highway-h">' +
@@ -545,6 +632,12 @@ function _wireChrome(root) {
     root.querySelector('.drums-profile-name-cancel').onclick = function () {
         _hideNameForm();
     };
+    var attach = root.querySelector('.drums-attach-select');
+    if (attach) {
+        attach.onchange = function () {
+            _onAttachDevice(this.value);
+        };
+    }
 }
 
 function mountDrumEditor(host, opts) {
@@ -580,6 +673,10 @@ function mountDrumEditor(host, opts) {
     };
 
     refreshProfiles();
+    listMidiDevices().then(function () {
+        _fillAttachSelect();
+    });
+    _bindMidiDeviceList();
     if (typeof opts.onMounted === 'function') opts.onMounted(root, { context: context });
     return { ok: true, context: context, root: root };
 }
@@ -652,7 +749,7 @@ function openPauseDrumEditor(opts) {
 
 function resetForTests() {
     unmountDrumEditor();
-    _cache = { profiles: [], activeId: '', active: null };
+    _cache = { profiles: [], activeId: '', active: null, devices: [], midiAvailable: false };
     _persistSeq = 0;
 }
 
@@ -664,15 +761,18 @@ var api = {
     persistActivePatch: persistActivePatch,
     refreshProfiles: refreshProfiles,
     listProfiles: listProfiles,
+    listMidiDevices: listMidiDevices,
     saveProfile: saveProfile,
     activateProfile: activateProfile,
     deleteProfile: deleteProfile,
     slugifyName: slugifyName,
     uniqueProfileId: uniqueProfileId,
+    normalizeDeviceId: normalizeDeviceId,
     learnLockMessage: learnLockMessage,
     isLearnLockedStatus: isLearnLockedStatus,
     resetForTests: resetForTests,
     PROFILE_ID_RE: PROFILE_ID_RE,
+    DEVICE_ID_RE: DEVICE_ID_RE,
 };
 
 if (typeof window !== 'undefined') {

@@ -174,6 +174,7 @@ function _validateCustomMapping(raw) {
 // live in core kit records, never in the legacy drums_custom_map store.
 const _PIECE_ID_RE = /^[a-z][a-z0-9_]*$/;
 const _KIT_ID_RE = /^[a-z0-9-]+$/;
+const _DEVICE_ID_RE = /^[a-z0-9-]+$/;
 const _DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 function _isSafeKey(key) {
@@ -232,12 +233,17 @@ let _pieceToLaneByPreset = {
     rb4: Object.assign(Object.create(null), _FALLBACK_PIECE_TO_LANE.rb4),
 };
 let _vocabMidiToPiece = null;   // GM midi→piece from vocabulary (null = use PIECE_DEFAULT_MIDI)
-let _kitNotes = null;           // active_kit midi→piece overlay (null-prototype or null)
+let _kitNotes = null;           // legacy kit overlay (not scoring SoT after INIT-003/SPEC-012)
 let _kitList = [];              // [{id, name, manufacturer, source, notes}]
 let _activeKitId = null;
 let _pendingKitId = '';
 let _kitSuggestId = null;
 let _pendingPieceNotes = null;  // piece-id map accumulated by Learn until PUT
+// INIT-003/SPEC-012: attached MIDI device notes are the scoring overlay SoT.
+let _attachedDeviceId = '';
+let _deviceNotes = null;
+let _deviceRefetchSeq = 0;
+let _midiDeviceScoringBound = false;
 // INIT-002/SPEC-003: generation tokens so a stale confirm/refetch cannot
 // enable mapping controls for a newer kit selection.
 let _kitConfirmSeq = 0;
@@ -344,6 +350,98 @@ function _applyActiveKitNotes(kit) {
     const overlay = _parseKitNotes(kit);
     _kitNotes = overlay || Object.create(null);
     return overlay !== null;
+}
+
+function _midiDevicesApi() {
+    const fb = (typeof window !== 'undefined')
+        ? (window.feedBack || window.feedback || window.slopsmith)
+        : null;
+    const api = fb && fb.midiDevices;
+    if (!api || typeof api !== 'object') return null;
+    if (typeof api.get !== 'function' && typeof api.list !== 'function') return null;
+    return api;
+}
+
+function _normalizeAttachedDeviceId(raw) {
+    if (typeof raw !== 'string' || !raw) return '';
+    return _DEVICE_ID_RE.test(raw) ? raw : '';
+}
+
+function _applyDeviceNotes(device) {
+    if (!device || typeof device !== 'object' || Array.isArray(device)) {
+        _deviceNotes = null;
+        return false;
+    }
+    const overlay = _validatePieceMapping(device.notes, _knownPieceIds);
+    _deviceNotes = overlay;
+    return overlay !== null;
+}
+
+function _clearAttachedDevice() {
+    _attachedDeviceId = '';
+    _deviceNotes = null;
+}
+
+async function _refetchAttachedDevice(deviceId) {
+    const id = _normalizeAttachedDeviceId(deviceId != null ? deviceId : _attachedDeviceId);
+    if (!id) {
+        _clearAttachedDevice();
+        return null;
+    }
+    _attachedDeviceId = id;
+    const myGen = ++_deviceRefetchSeq;
+    const api = _midiDevicesApi();
+    let device = null;
+    if (api && typeof api.get === 'function') {
+        try { device = await api.get.call(api, id); } catch (_) { device = null; }
+    } else if (typeof fetch === 'function') {
+        try {
+            const res = await fetch('/api/midi/devices/' + encodeURIComponent(id));
+            if (res && res.ok) {
+                try { device = await res.json(); } catch (_) { device = null; }
+            }
+        } catch (_) { device = null; }
+    }
+    if (myGen !== _deviceRefetchSeq) return null;
+    if (_attachedDeviceId !== id) return null;
+    _applyDeviceNotes(device);
+    if (device && device.input && typeof device.input === 'object') {
+        const input = device.input;
+        const patch = {};
+        if (typeof input.midi_channel === 'number') patch.midiChannel = input.midi_channel;
+        if (typeof input.hit_detection === 'boolean') patch.hitDetection = input.hit_detection;
+        if (typeof input.synth_volume === 'number') patch.synthVolume = input.synth_volume;
+        if (Object.keys(patch).length) _setSharedSetting(patch);
+    }
+    const src = device && typeof device.source_id === 'string' ? device.source_id : '';
+    if (src && (!_midiInput || _midiInput.key !== src)) _midiConnect(src);
+    else if (!src && _midiInput) _midiConnect('');
+    return device;
+}
+
+function _onMidiDeviceChange(ev) {
+    const detail = (ev && ev.detail) || ev || {};
+    const eventId = _normalizeAttachedDeviceId(detail.device_id);
+    if (!_attachedDeviceId) return;
+    if (eventId && eventId !== _attachedDeviceId) return;
+    _refetchAttachedDevice(_attachedDeviceId);
+}
+
+function _bindMidiDeviceScoring() {
+    if (_midiDeviceScoringBound) return;
+    if (typeof window === 'undefined') return;
+    _midiDeviceScoringBound = true;
+    window.__feedBackDrumsMidiDeviceHook = true;
+    const api = _midiDevicesApi();
+    if (api && typeof api.subscribe === 'function') {
+        api.subscribe(_onMidiDeviceChange);
+        return;
+    }
+    if (typeof document !== 'undefined' && document.addEventListener) {
+        document.addEventListener('feedback:midi-device-change', _onMidiDeviceChange);
+    }
+    const fb = window.feedBack || window.feedback || window.slopsmith;
+    if (fb && typeof fb.on === 'function') fb.on('feedback:midi-device-change', _onMidiDeviceChange);
 }
 
 function _pieceToLaneId(piece, presetName) {
@@ -866,34 +964,19 @@ function _getActiveDrumMap() {
 }
 
 function _midiToLaneIdx(midiNote) {
-    // INIT-001/SPEC-005 dual-read:
-    // 1. If a core active_kit is set, prefer its piece-id map (then piece→lane).
-    // 2. Else if drums_custom_map is a valid lane-keyed map, keep using it.
-    // 3. Else GM notes from the current lane preset.
-    // Unmapped kit notes fall through to GM, not to the legacy store.
-    if (_kitNotes) {
-        const piece = _kitNotes[midiNote];
-        if (piece) {
-            const laneId = _pieceToLaneId(piece);
-            if (laneId) {
-                const idx = DRUM_LANES.findIndex(l => l.id === laneId);
-                if (idx >= 0) return idx;
-            }
-        }
-        return _midiToLane[midiNote] !== undefined ? _midiToLane[midiNote] : -1;
-    }
-    const custom = _cfg.customMapping;
-    if (custom) {
-        const laneId = custom[midiNote];
+    // INIT-003/SPEC-012: attached MIDI device notes are scoring SoT.
+    // Empty device_id or empty/unmapped notes → unmapped (no GM / kit fallback).
+    // Chart highway still uses _songNoteToLaneIdx / lane presets.
+    if (!_attachedDeviceId || !_deviceNotes) return -1;
+    const piece = _deviceNotes[midiNote];
+    if (piece) {
+        const laneId = _pieceToLaneId(piece);
         if (laneId) {
             const idx = DRUM_LANES.findIndex(l => l.id === laneId);
-            // If the custom-mapped lane is absent in the active preset (e.g. user
-            // mapped a note to 'tom2' then switched to rb4 which has no tom2), fall
-            // through to the preset-aware default rather than silently returning -1.
             if (idx >= 0) return idx;
         }
     }
-    return _midiToLane[midiNote] !== undefined ? _midiToLane[midiNote] : -1;
+    return -1;
 }
 
 function _songNoteToLaneIdx(midi) {
@@ -1878,16 +1961,7 @@ function _wireKitControls(scope) {
 
 function _collectProfilePatch() {
     return {
-        kit_id: _activeKitId || '',
-        device: {
-            source_id: (_midiInput && _midiInput.key) || '',
-            enabled: Boolean(_midiInput && _midiInput.key),
-        },
-        input: {
-            midi_channel: _cfg.midiChannel,
-            hit_detection: _cfg.hitDetection,
-            synth_volume: _cfg.synthVolume,
-        },
+        device_id: _attachedDeviceId || '',
         highway: {
             '2d': {
                 lane_preset: _cfg.lanePreset,
@@ -1925,29 +1999,17 @@ function _syncEditorControlsFromCfg() {
 function _applyDrumProfile(profile) {
     if (!profile || typeof profile !== 'object') return;
     const apply = function () {
-        const input = profile.input || {};
-        const device = profile.device || {};
         const hw2d = profile.highway && profile.highway['2d'] ? profile.highway['2d'] : {};
-        if (typeof input.synth_volume === 'number') _setSharedSetting({ synthVolume: input.synth_volume });
-        if (typeof input.midi_channel === 'number') _setSharedSetting({ midiChannel: input.midi_channel });
-        if (typeof input.hit_detection === 'boolean') {
-            _setSharedSetting({ hitDetection: input.hit_detection });
-        }
         if (hw2d.lane_preset && _VALID_LANE_PRESETS.has(hw2d.lane_preset)) {
             _saveCfg('lanePreset', hw2d.lane_preset);
             _applyLanePreset(_cfg.lanePreset);
             _cfg.learnLane = null;
             _cfg.learnPiece = null;
-            _refreshAllMappingTables();
         }
         if (typeof hw2d.show_lane_labels === 'boolean') _saveCfg('showLaneLabels', hw2d.show_lane_labels);
-        const src = typeof device.source_id === 'string' ? device.source_id : '';
-        if (src && (!_midiInput || _midiInput.key !== src)) _midiConnect(src);
-        else if (!src && _midiInput) _midiConnect('');
-        if (profile.kit_id && _KIT_ID_RE.test(profile.kit_id) && profile.kit_id !== _activeKitId) {
-            _confirmActiveKit(profile.kit_id);
-        }
-        _midiUpdateAllDeviceLists();
+        const deviceId = _normalizeAttachedDeviceId(profile.device_id);
+        if (deviceId) _refetchAttachedDevice(deviceId);
+        else _clearAttachedDevice();
         _syncEditorControlsFromCfg();
     };
     if (typeof requestAnimationFrame === 'function') requestAnimationFrame(apply);
@@ -1956,32 +2018,6 @@ function _applyDrumProfile(profile) {
 
 function _hydrateDrumEditor(root) {
     if (!root || typeof root.querySelector !== 'function') return;
-    const midiSel = root.querySelector('.drums-midi-select');
-    if (midiSel) {
-        midiSel.onchange = function () {
-            if (_applyingSharedSettings) return;
-            _midiConnect(this.value);
-            _synthInit();
-            _setSharedSetting({ deviceEnabled: Boolean(this.value) });
-            _persistEditorPatch();
-        };
-    }
-    const vol = root.querySelector('.drums-vol-slider');
-    if (vol) {
-        vol.oninput = function () {
-            if (_applyingSharedSettings) return;
-            _synthSetVolume(parseInt(this.value, 10) / 100);
-            _persistEditorPatch();
-        };
-    }
-    const ch = root.querySelector('.drums-channel-select');
-    if (ch) {
-        ch.onchange = function () {
-            if (_applyingSharedSettings) return;
-            _setSharedSetting({ midiChannel: parseInt(this.value, 10) });
-            _persistEditorPatch();
-        };
-    }
     const preset = root.querySelector('.drums-lane-preset');
     if (preset) {
         preset.onchange = function () {
@@ -1994,7 +2030,6 @@ function _hydrateDrumEditor(root) {
                     sel.value = _cfg.lanePreset;
                 });
             }
-            _refreshAllMappingTables();
             _persistEditorPatch();
         };
     }
@@ -2005,44 +2040,17 @@ function _hydrateDrumEditor(root) {
             _persistEditorPatch();
         };
     }
-    const hits = root.querySelector('.drums-chk-hits');
-    if (hits) {
-        hits.onchange = function () {
-            if (_applyingSharedSettings) return;
-            _setSharedSetting({ hitDetection: this.checked });
-            if (this.checked && _instances.size) {
-                _instances.forEach(function (inst) {
-                    if (inst && typeof inst._resetScoring === 'function') inst._resetScoring();
-                });
-            }
-            _persistEditorPatch();
-        };
-    }
-    const reset = root.querySelector('.drums-reset-map');
-    if (reset) {
-        reset.onclick = function () {
-            _saveCfg('customMapping', null);
-            _refreshAllMappingTables();
-            _midiUpdateAllDeviceLists();
-        };
-    }
-    const table = root.querySelector('.drums-map-table');
-    if (table) table.innerHTML = _buildMappingRows();
-    _wireMappingControls(root);
-    _refreshMapStatus();
-    _wireKitControls(root);
-    const confirm = root.querySelector('.drums-kit-confirm');
-    if (confirm) {
-        const prev = confirm.onclick;
-        confirm.onclick = function () {
-            if (typeof prev === 'function') prev.call(this);
-            _persistEditorPatch();
-        };
-    }
-    _midiUpdateAllDeviceLists();
     _bindDrumInputContract();
-    _consumeCoreKits();
+    _bindMidiDeviceScoring();
     _syncEditorControlsFromCfg();
+    const editor = _getDrumEditor();
+    if (editor && typeof editor.refreshProfiles === 'function') {
+        editor.refreshProfiles().then(function (cache) {
+            const id = cache && cache.active && cache.active.device_id;
+            if (id) _refetchAttachedDevice(id);
+            else _clearAttachedDevice();
+        });
+    }
 }
 
 function _onDrumProfileChange(ev) {
@@ -2086,6 +2094,7 @@ function _bootSettingsEditor() {
         const fb = window.feedBack;
         if (fb && typeof fb.on === 'function') fb.on('feedback:drum-profile-change', _onDrumProfileChange);
     }
+    _bindMidiDeviceScoring();
 }
 
 if (typeof document !== 'undefined') _bootSettingsEditor();
@@ -3110,6 +3119,7 @@ function createFactory() {
             _midiInit();
             _synthInit();
             _bindDrumInputContract();
+            _bindMidiDeviceScoring();
             _consumeCoreKits();
 
             _isReady = true;
@@ -3314,6 +3324,18 @@ if (typeof module !== 'undefined' && module.exports) {
         _getDrumEditor, _hydrateDrumEditor, _collectProfilePatch, _applyDrumProfile,
         _bootSettingsEditor, _learnLockMessage, _isLearnLockedStatus, _fetchJsonResult,
         _persistEditorPatch, _onDrumProfileChange,
+        _refetchAttachedDevice, _applyDeviceNotes, _clearAttachedDevice, _onMidiDeviceChange,
+        _bindMidiDeviceScoring, _normalizeAttachedDeviceId,
+        _getAttachedDeviceId() { return _attachedDeviceId; },
+        _getDeviceNotes() { return _deviceNotes; },
+        _setAttachedDevice(id, device) {
+            _attachedDeviceId = _normalizeAttachedDeviceId(id);
+            if (!_attachedDeviceId) {
+                _deviceNotes = null;
+                return;
+            }
+            _applyDeviceNotes(device || null);
+        },
     };
 }
 

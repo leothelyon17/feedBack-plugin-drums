@@ -84,12 +84,12 @@ test('_drumTabHitsToNotes ignores a non-array payload', () => {
     assert.deepEqual(mod._drumTabHitsToNotes('nope'), []);
 });
 
-test('lane preset switch rebuilds DRUM_LANES and the default map', () => {
+test('lane preset switch rebuilds DRUM_LANES and the highway song-note map', () => {
     const mod = freshPlugin();
     mod._applyLanePreset('rb4');
     assert.deepEqual(mod.DRUM_LANES.map(l => l.id), ['hihat', 'snare', 'tom1', 'tom3', 'crash', 'ride', 'kick']);
     // In rb4, mid-tom notes 45/47 fold into tom1 (no separate tom2 lane).
-    assert.equal(mod._midiToLaneIdx(45), mod.DRUM_LANES.findIndex(l => l.id === 'tom1'));
+    assert.equal(mod._songNoteToLaneIdx(45), mod.DRUM_LANES.findIndex(l => l.id === 'tom1'));
 
     mod._applyLanePreset('phase_shift_8');
     assert.deepEqual(mod.DRUM_LANES.map(l => l.id),
