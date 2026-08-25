@@ -235,3 +235,156 @@
     text-transform: uppercase;
     color: #9ca3af;
 }
+
+/* INIT-004/SPEC-002: Calibration ritual (MIDI panel + overlay). */
+.drums-timing {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    color: #d1d5db;
+    font-size: 13px;
+}
+
+.drums-timing-title {
+    margin: 0;
+    font-size: 13px;
+    font-weight: 600;
+    color: #e5e7eb;
+}
+
+.drums-timing-status {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    align-items: baseline;
+}
+
+.drums-timing-device {
+    color: #9ca3af;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.drums-timing-offset {
+    font-family: ui-monospace, monospace;
+    color: #e5e7eb;
+}
+
+.drums-timing-remeasure,
+.drums-timing-gate {
+    background: rgba(120, 53, 15, 0.35);
+    border: 1px solid #b45309;
+    border-radius: 6px;
+    padding: 8px 10px;
+    color: #fde68a;
+}
+
+.drums-timing-remeasure p,
+.drums-timing-gate p,
+.drums-timing-progress,
+.drums-timing-hint {
+    margin: 0;
+    font-size: 12px;
+    line-height: 1.4;
+}
+
+.drums-timing-hint {
+    color: #9ca3af;
+}
+
+.drums-timing-beat {
+    position: relative;
+    height: 36px;
+    background: rgba(17, 24, 39, 0.9);
+    border: 1px solid #1f2937;
+    border-radius: 6px;
+    overflow: hidden;
+}
+
+.drums-timing-now {
+    position: absolute;
+    left: 50%;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: #e5e7eb;
+    transform: translateX(-1px);
+}
+
+.drums-timing-marker {
+    position: absolute;
+    top: 6px;
+    transform: translateX(-50%);
+    font-size: 16px;
+    line-height: 24px;
+}
+
+.drums-timing-marker--early { color: #93c5fd; }
+.drums-timing-marker--late { color: #fbbf24; }
+.drums-timing-marker--on { color: #34d399; }
+
+.drums-timing-live {
+    min-height: 1.2em;
+    font-size: 12px;
+    color: #e5e7eb;
+}
+
+.drums-timing-actions,
+.drums-timing-manual,
+.drums-timing-overlay-foot {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+}
+
+.drums-timing-btn {
+    background: #1f2937;
+    border: 1px solid #374151;
+    border-radius: 6px;
+    color: #e5e7eb;
+    font-size: 12px;
+    padding: 6px 12px;
+    cursor: pointer;
+}
+
+.drums-timing-btn-primary {
+    background: #1d4ed8;
+    border-color: #2563eb;
+    color: #fff;
+}
+
+.drums-timing-btn-secondary {
+    background: transparent;
+    color: #93c5fd;
+}
+
+.drums-timing-btn-ghost {
+    background: transparent;
+    border-color: transparent;
+    color: #9ca3af;
+}
+
+.drums-timing-manual input {
+    width: 5.5rem;
+    background: #1a1a2e;
+    border: 1px solid #333;
+    border-radius: 6px;
+    color: #ccc;
+    padding: 4px 8px;
+    margin-left: 6px;
+}
+
+.drums-timing-hidden,
+.drums-timing [hidden] {
+    display: none;
+}
+
+.drums-timing-overlay-sheet {
+    width: min(28rem, 92vw);
+    background: rgba(17, 24, 39, 0.98);
+    border: 1px solid #1f2937;
+    border-radius: 10px;
+    padding: 16px;
+}

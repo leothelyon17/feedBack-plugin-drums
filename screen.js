@@ -38,6 +38,13 @@ if (typeof require === 'function' && typeof module !== 'undefined') {
     try { _drumsEditorMod = require('./assets/drum-editor.js'); } catch (_) { _drumsEditorMod = null; }
 }
 
+// INIT-004/SPEC-002: Calibration module (inline MIDI panel + overlay).
+var _drumTimingMod = null;
+var _drumTimingLoadPromise = null;
+if (typeof require === 'function' && typeof module !== 'undefined') {
+    try { _drumTimingMod = require('./assets/drum-timing.js'); } catch (_) { _drumTimingMod = null; }
+}
+
 function _getDrumEditor() {
     if (_drumsEditorMod) return _drumsEditorMod;
     if (typeof window !== 'undefined' && window.feedBackDrumsEditor) {
@@ -71,6 +78,71 @@ function _ensureDrumEditor(cb) {
         cb(mod);
     });
 }
+
+function _getDrumTiming() {
+    if (_drumTimingMod) return _drumTimingMod;
+    if (typeof window !== 'undefined' && window.feedBackDrumsTiming) {
+        _drumTimingMod = window.feedBackDrumsTiming;
+        return _drumTimingMod;
+    }
+    return null;
+}
+
+function _ensureDrumTiming(cb) {
+    const existing = _getDrumTiming();
+    if (existing) {
+        cb(existing);
+        return;
+    }
+    if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
+        cb(null);
+        return;
+    }
+    if (!_drumTimingLoadPromise) {
+        _drumTimingLoadPromise = new Promise(function (resolve) {
+            const s = document.createElement('script');
+            s.src = '/api/plugins/drums/assets/drum-timing.js?v=init-004-spec-002';
+            s.onload = function () { resolve(window.feedBackDrumsTiming || null); };
+            s.onerror = function () { resolve(null); };
+            (document.head || document.documentElement).appendChild(s);
+        });
+    }
+    _drumTimingLoadPromise.then(function (mod) {
+        if (mod) _drumTimingMod = mod;
+        cb(mod);
+    });
+}
+
+function _publishDrumTimingFacade() {
+    if (typeof window === 'undefined') return;
+    window.feedBack = window.feedBack || {};
+    if (window.feedBack.drumTiming && window.feedBack.drumTiming.version === 1) return;
+    const live = _getDrumTiming();
+    window.feedBack.drumTiming = {
+        version: live && live.version ? live.version : 0,
+        mount: function (host) {
+            const api = _getDrumTiming();
+            if (api && typeof api.mount === 'function') return api.mount(host);
+            _ensureDrumTiming(function (mod) {
+                if (mod && typeof mod.mount === 'function') mod.mount(host);
+            });
+        },
+        run: function (opts) {
+            const api = _getDrumTiming();
+            if (api && typeof api.run === 'function') return api.run(opts);
+            _ensureDrumTiming(function (mod) {
+                if (mod && typeof mod.run === 'function') mod.run(opts);
+            });
+        },
+        getOffsetMs: function () {
+            const api = _getDrumTiming();
+            if (api && typeof api.getOffsetMs === 'function') return api.getOffsetMs();
+            return 0;
+        },
+    };
+}
+
+if (typeof window !== 'undefined') _publishDrumTimingFacade();
 
 // ═══════════════════════════════════════════════════════════════════════
 // Config
@@ -2093,7 +2165,18 @@ function _bootSettingsEditor() {
     _bindMidiDeviceScoring();
 }
 
+function _bootDrumTiming() {
+    _publishDrumTimingFacade();
+    _ensureDrumTiming(function (api) {
+        _publishDrumTimingFacade();
+        if (!api || typeof document === 'undefined' || typeof document.getElementById !== 'function') return;
+        const panel = document.getElementById('midi-calibration-panel');
+        if (panel && typeof api.mount === 'function') api.mount(panel);
+    });
+}
+
 if (typeof document !== 'undefined') _bootSettingsEditor();
+if (typeof document !== 'undefined') _bootDrumTiming();
 
 // ═══════════════════════════════════════════════════════════════════════
 // Splitscreen helper wrappers
