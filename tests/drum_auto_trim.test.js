@@ -56,6 +56,17 @@ function earlyFixture() {
     ];
 }
 
+function exactThresholdMedianFixture(inlierMs) {
+    // 18 identical inliers plus 2 far outliers (−80, +40). With n=20, YARG
+    // q1=sorted[5] and q3=sorted[15] both equal the inlier, so IQR=0 and the
+    // fence keeps only the 18 inliers. Even-n median of 18 copies is exactly
+    // inlierMs (the two middle values are the same).
+    const batch = [];
+    for (let i = 0; i < 18; i++) batch.push(inlierMs);
+    batch.push(-80, 40);
+    return batch;
+}
+
 test('constants match YARG AutoCalibrator', () => {
     const mod = freshTrim();
     assert.equal(mod.SAMPLE_SIZE, 20);
@@ -162,6 +173,63 @@ test('ac-4: |batch median| ≤ 5 ms is stable and does not persist', () => {
     const ui = mod.uiModel();
     assert.equal(ui.stable, true);
     assert.match(ui.statusLabel, /Stable/i);
+});
+
+test('ac-4: exact |median| 5.0 after IQR is stable; just above 5 applies', () => {
+    // Inclusive YARG <= STABLE_THRESHOLD_MS — 5.0 is stable, 5.1 is not (HITL 2026-08-25).
+    assert.match(TRIM_SRC, /Math\.abs\(med\)\s*<=\s*STABLE_THRESHOLD_MS/);
+    assert.doesNotMatch(TRIM_SRC, /Math\.abs\(med\)\s*<\s*STABLE_THRESHOLD_MS/);
+
+    const pos = exactThresholdMedianFixture(5.0);
+    const neg = exactThresholdMedianFixture(-5.0);
+    const above = exactThresholdMedianFixture(5.1);
+    assert.equal(pos.length, 20);
+    assert.equal(neg.length, 20);
+    assert.equal(above.length, 20);
+
+    const probe = freshTrim();
+    assert.equal(probe.calculateMedian(probe.removeOutliers(pos)), 5.0);
+    assert.equal(probe.calculateMedian(probe.removeOutliers(neg)), -5.0);
+    assert.equal(probe.calculateMedian(probe.removeOutliers(above)), 5.1);
+
+    const atPos = probe.considerBatch(pos);
+    assert.equal(atPos.median, 5.0);
+    assert.equal(atPos.stable, true);
+    assert.equal(atPos.apply, false);
+    assert.equal(atPos.deltaMs, 0);
+
+    const atNeg = probe.considerBatch(neg);
+    assert.equal(atNeg.median, -5.0);
+    assert.equal(atNeg.stable, true);
+    assert.equal(atNeg.apply, false);
+    assert.equal(atNeg.deltaMs, 0);
+
+    const over = probe.considerBatch(above);
+    assert.equal(over.median, 5.1);
+    assert.equal(over.stable, false);
+    assert.equal(over.apply, true);
+    assert.ok(Math.abs(over.median) > probe.STABLE_THRESHOLD_MS);
+
+    const recPos = freshTrim();
+    recPos.setEnabled(true);
+    for (let i = 0; i < 20; i++) recPos.recordHit(pos[i]);
+    assert.equal(recPos.isStable(), true);
+    assert.equal(recPos._writes.length, 0);
+    assert.equal(recPos._lastWrite(), null);
+
+    const recNeg = freshTrim();
+    recNeg.setEnabled(true);
+    for (let i = 0; i < 20; i++) recNeg.recordHit(neg[i]);
+    assert.equal(recNeg.isStable(), true);
+    assert.equal(recNeg._writes.length, 0);
+
+    const recAbove = freshTrim();
+    recAbove.setEnabled(true);
+    for (let i = 0; i < 20; i++) recAbove.recordHit(above[i]);
+    assert.equal(recAbove.isStable(), false);
+    assert.equal(recAbove._writes.length, 1);
+    assert.ok(recAbove._lastWrite());
+    assert.equal(typeof recAbove._writes[0].offset_ms, 'number');
 });
 
 test('ac-3: enabled marks practice; disable restores scoring; run stays flagged', () => {

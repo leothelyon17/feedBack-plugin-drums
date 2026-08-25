@@ -116,6 +116,7 @@ function considerBatch(values) {
     if (!Number.isFinite(med)) {
         return { apply: false, stable: false, reason: 'no-median', count: nums.length, median: null, deltaMs: 0 };
     }
+    // Inclusive YARG <= STABLE_THRESHOLD_MS: exact |median| 5.0 ms is stable (HITL 2026-08-25).
     if (Math.abs(med) <= STABLE_THRESHOLD_MS) {
         return { apply: false, stable: true, reason: 'stable', count: nums.length, median: med, deltaMs: 0 };
     }
