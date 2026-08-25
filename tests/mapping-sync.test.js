@@ -456,11 +456,17 @@ test('REQ-004: chip labels escape untrusted piece ids (defense in depth)', () =>
     assert.equal(mod._buildNoteChipsHtml('<img>'), '');
 });
 
-test('GR-008: settings panel keeps z-index 50 and pointer-events auto', () => {
+test('GR-008 / INIT-003/SPEC-005: overlay editor is gone; pause dialog owns z-index 50', () => {
     const src = require('node:fs').readFileSync(
         path.join(__dirname, '..', 'screen.js'),
         'utf8',
     );
-    assert.match(src, /z-index:50/);
-    assert.match(src, /pointer-events:auto/);
+    const editor = require('node:fs').readFileSync(
+        path.join(__dirname, '..', 'assets', 'drum-editor.js'),
+        'utf8',
+    );
+    assert.doesNotMatch(src, /<summary style="font-size:10px;color:#666;cursor:pointer;">MIDI Mapping<\/summary>/);
+    assert.match(src, /Open drum settings/);
+    assert.match(editor, /z-index:50/);
+    assert.match(editor, /pointer-events:auto/);
 });

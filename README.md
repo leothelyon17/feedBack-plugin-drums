@@ -14,10 +14,10 @@ A plugin for [Slopsmith](https://github.com/got-feedback/feedback) that replaces
 - **Velocity-based sizing** — louder hits are bigger, ghost notes are smaller
 - **Auto-activate** — switches on automatically for Drums/Percussion arrangements
 - **MIDI drum pad input** — connect any MIDI drum pad, electronic kit, or controller via Web MIDI API
-- **Custom MIDI mapping** — "Learn" mode to assign any MIDI note to any lane, for non-standard drum pads
+- **Custom MIDI mapping** — Settings → MIDI Learn assigns pads on a MIDI device; the Drums tab attaches a profile to that device
 - **Built-in drum sounds** — WebAudioFont-powered GM drum kit playback on MIDI hit
 - **Accuracy scoring** — hit detection with tight +/-50ms timing window, accuracy %, streak counter
-- **Inline settings** — MIDI device, volume, channel filter, lane labels, hit detection, and mapping table
+- **Drum settings editor** — Settings → Drums → **Profiles**: name a profile, attach a MIDI device, map lanes from that device's pads, and **Make active** (one active profile). 2D lane preset lives in the **2D Drum Highway** disclosure. Same editor from the in-song gear.
 
 ## Drum Lanes
 
@@ -45,7 +45,7 @@ git clone https://github.com/got-feedback/feedback-plugin-drums.git drums
 docker compose restart
 ```
 
-A "Drums" button will appear in the player controls when you play a song. Click the gear icon next to it to configure MIDI input and sound settings.
+A "Drums" button will appear in the player controls when you play a song. The gear opens the same Drum settings editor as Settings → Drums (profile, attach MIDI device, highway lanes). Mapping and MIDI knobs live on Settings → MIDI. Only one editor instance is mounted at a time.
 
 ## How It Works
 
@@ -53,7 +53,7 @@ The plugin reads note data from the highway renderer and maps them to drum lanes
 
 ### MIDI Drum Pad
 
-Connect a USB MIDI drum pad or electronic kit and select it from the settings panel. Play along and get real-time visual feedback:
+Connect a USB MIDI drum pad or electronic kit, configure it on Settings → MIDI, then attach that device on Settings → Drums. Play along and get real-time visual feedback:
 
 - **Lane flash** — the lane lights up when you hit the correct drum piece
 - **Green notes** — correctly hit notes within the timing window
@@ -62,16 +62,14 @@ Connect a USB MIDI drum pad or electronic kit and select it from the settings pa
 
 ### Custom Mapping
 
-Different drum pads send different MIDI note numbers. Use "Learn" in settings to remap by hitting a pad (keyboard is not required):
+Different drum pads send different MIDI note numbers. Map them on **Settings → MIDI** (device type, Learn table, channel / hits / volume). The Drums tab only attaches a named profile to an existing MIDI device and configures highway lanes.
 
-1. Open settings and expand "MIDI Mapping"
-2. Click "Learn" next to a piece (for example snare or tom hi)
-3. Hit the pad you want to assign
-4. The plugin saves a piece-id map to a core user kit (`PUT /api/drums/kits/{id}`) and a derived lane map into the existing Learn store
+1. Create or select a MIDI device on Settings → MIDI and Learn the pad map there
+2. Open Drum settings (Settings → Drums, or the in-song gear)
+3. Attach that MIDI device to the active drum profile
+4. Scoring uses the attached device's `notes`. An empty attach leaves hits unmapped; the highway still plays
 
-Shipped kits (for example Alesis Strata Prime) appear in the Kit dropdown. Selecting one **requires** clicking **Use this kit** — the plugin may suggest a kit from the MIDI source key, but it never auto-applies.
-
-Click "Reset Map" to clear the local lane map (core kits are unchanged).
+A profile never stores a copy of the note map. `device_id` is the attach pointer.
 
 ## License
 

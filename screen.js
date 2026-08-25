@@ -31,6 +31,47 @@
 (function () {
 'use strict';
 
+// INIT-003/SPEC-005: shared editor lives in assets/drum-editor.js.
+var _drumsEditorMod = null;
+var _editorLoadPromise = null;
+if (typeof require === 'function' && typeof module !== 'undefined') {
+    try { _drumsEditorMod = require('./assets/drum-editor.js'); } catch (_) { _drumsEditorMod = null; }
+}
+
+function _getDrumEditor() {
+    if (_drumsEditorMod) return _drumsEditorMod;
+    if (typeof window !== 'undefined' && window.feedBackDrumsEditor) {
+        _drumsEditorMod = window.feedBackDrumsEditor;
+        return _drumsEditorMod;
+    }
+    return null;
+}
+
+function _ensureDrumEditor(cb) {
+    const existing = _getDrumEditor();
+    if (existing) {
+        cb(existing);
+        return;
+    }
+    if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
+        cb(null);
+        return;
+    }
+    if (!_editorLoadPromise) {
+        _editorLoadPromise = new Promise(function (resolve) {
+            const s = document.createElement('script');
+            s.src = '/api/plugins/drums/assets/drum-editor.js?v=type-pool-1';
+            s.onload = function () { resolve(window.feedBackDrumsEditor || null); };
+            s.onerror = function () { resolve(null); };
+            (document.head || document.documentElement).appendChild(s);
+        });
+    }
+    _editorLoadPromise.then(function (mod) {
+        if (mod) _drumsEditorMod = mod;
+        cb(mod);
+    });
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Config
 // ═══════════════════════════════════════════════════════════════════════
@@ -133,6 +174,7 @@ function _validateCustomMapping(raw) {
 // live in core kit records, never in the legacy drums_custom_map store.
 const _PIECE_ID_RE = /^[a-z][a-z0-9_]*$/;
 const _KIT_ID_RE = /^[a-z0-9-]+$/;
+const _DEVICE_ID_RE = /^[a-z0-9-]+$/;
 const _DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 function _isSafeKey(key) {
@@ -191,12 +233,17 @@ let _pieceToLaneByPreset = {
     rb4: Object.assign(Object.create(null), _FALLBACK_PIECE_TO_LANE.rb4),
 };
 let _vocabMidiToPiece = null;   // GM midi→piece from vocabulary (null = use PIECE_DEFAULT_MIDI)
-let _kitNotes = null;           // active_kit midi→piece overlay (null-prototype or null)
+let _kitNotes = null;           // legacy kit overlay (not scoring SoT after INIT-003/SPEC-012)
 let _kitList = [];              // [{id, name, manufacturer, source, notes}]
 let _activeKitId = null;
 let _pendingKitId = '';
 let _kitSuggestId = null;
 let _pendingPieceNotes = null;  // piece-id map accumulated by Learn until PUT
+// INIT-003/SPEC-012: attached MIDI device notes are the scoring overlay SoT.
+let _attachedDeviceId = '';
+let _deviceNotes = null;
+let _deviceRefetchSeq = 0;
+let _midiDeviceScoringBound = false;
 // INIT-002/SPEC-003: generation tokens so a stale confirm/refetch cannot
 // enable mapping controls for a newer kit selection.
 let _kitConfirmSeq = 0;
@@ -303,6 +350,98 @@ function _applyActiveKitNotes(kit) {
     const overlay = _parseKitNotes(kit);
     _kitNotes = overlay || Object.create(null);
     return overlay !== null;
+}
+
+function _midiDevicesApi() {
+    const fb = (typeof window !== 'undefined')
+        ? (window.feedBack || window.feedback || window.slopsmith)
+        : null;
+    const api = fb && fb.midiDevices;
+    if (!api || typeof api !== 'object') return null;
+    if (typeof api.get !== 'function' && typeof api.list !== 'function') return null;
+    return api;
+}
+
+function _normalizeAttachedDeviceId(raw) {
+    if (typeof raw !== 'string' || !raw) return '';
+    return _DEVICE_ID_RE.test(raw) ? raw : '';
+}
+
+function _applyDeviceNotes(device) {
+    if (!device || typeof device !== 'object' || Array.isArray(device)) {
+        _deviceNotes = null;
+        return false;
+    }
+    const overlay = _validatePieceMapping(device.notes, _knownPieceIds);
+    _deviceNotes = overlay;
+    return overlay !== null;
+}
+
+function _clearAttachedDevice() {
+    _attachedDeviceId = '';
+    _deviceNotes = null;
+}
+
+async function _refetchAttachedDevice(deviceId) {
+    const id = _normalizeAttachedDeviceId(deviceId != null ? deviceId : _attachedDeviceId);
+    if (!id) {
+        _clearAttachedDevice();
+        return null;
+    }
+    _attachedDeviceId = id;
+    const myGen = ++_deviceRefetchSeq;
+    const api = _midiDevicesApi();
+    let device = null;
+    if (api && typeof api.get === 'function') {
+        try { device = await api.get.call(api, id); } catch (_) { device = null; }
+    } else if (typeof fetch === 'function') {
+        try {
+            const res = await fetch('/api/midi/devices/' + encodeURIComponent(id));
+            if (res && res.ok) {
+                try { device = await res.json(); } catch (_) { device = null; }
+            }
+        } catch (_) { device = null; }
+    }
+    if (myGen !== _deviceRefetchSeq) return null;
+    if (_attachedDeviceId !== id) return null;
+    _applyDeviceNotes(device);
+    if (device && device.input && typeof device.input === 'object') {
+        const input = device.input;
+        const patch = {};
+        if (typeof input.midi_channel === 'number') patch.midiChannel = input.midi_channel;
+        if (typeof input.hit_detection === 'boolean') patch.hitDetection = input.hit_detection;
+        if (typeof input.synth_volume === 'number') patch.synthVolume = input.synth_volume;
+        if (Object.keys(patch).length) _setSharedSetting(patch);
+    }
+    const src = device && typeof device.source_id === 'string' ? device.source_id : '';
+    if (src && (!_midiInput || _midiInput.key !== src)) _midiConnect(src);
+    else if (!src && _midiInput) _midiConnect('');
+    return device;
+}
+
+function _onMidiDeviceChange(ev) {
+    const detail = (ev && ev.detail) || ev || {};
+    const eventId = _normalizeAttachedDeviceId(detail.device_id);
+    if (!_attachedDeviceId) return;
+    if (eventId && eventId !== _attachedDeviceId) return;
+    _refetchAttachedDevice(_attachedDeviceId);
+}
+
+function _bindMidiDeviceScoring() {
+    if (_midiDeviceScoringBound) return;
+    if (typeof window === 'undefined') return;
+    _midiDeviceScoringBound = true;
+    window.__feedBackDrumsMidiDeviceHook = true;
+    const api = _midiDevicesApi();
+    if (api && typeof api.subscribe === 'function') {
+        api.subscribe(_onMidiDeviceChange);
+        return;
+    }
+    if (typeof document !== 'undefined' && document.addEventListener) {
+        document.addEventListener('feedback:midi-device-change', _onMidiDeviceChange);
+    }
+    const fb = window.feedBack || window.feedback || window.slopsmith;
+    if (fb && typeof fb.on === 'function') fb.on('feedback:midi-device-change', _onMidiDeviceChange);
 }
 
 function _pieceToLaneId(piece, presetName) {
@@ -825,34 +964,19 @@ function _getActiveDrumMap() {
 }
 
 function _midiToLaneIdx(midiNote) {
-    // INIT-001/SPEC-005 dual-read:
-    // 1. If a core active_kit is set, prefer its piece-id map (then piece→lane).
-    // 2. Else if drums_custom_map is a valid lane-keyed map, keep using it.
-    // 3. Else GM notes from the current lane preset.
-    // Unmapped kit notes fall through to GM, not to the legacy store.
-    if (_kitNotes) {
-        const piece = _kitNotes[midiNote];
-        if (piece) {
-            const laneId = _pieceToLaneId(piece);
-            if (laneId) {
-                const idx = DRUM_LANES.findIndex(l => l.id === laneId);
-                if (idx >= 0) return idx;
-            }
-        }
-        return _midiToLane[midiNote] !== undefined ? _midiToLane[midiNote] : -1;
-    }
-    const custom = _cfg.customMapping;
-    if (custom) {
-        const laneId = custom[midiNote];
+    // INIT-003/SPEC-012: attached MIDI device notes are scoring SoT.
+    // Empty device_id or empty/unmapped notes → unmapped (no GM / kit fallback).
+    // Chart highway still uses _songNoteToLaneIdx / lane presets.
+    if (!_attachedDeviceId || !_deviceNotes) return -1;
+    const piece = _deviceNotes[midiNote];
+    if (piece) {
+        const laneId = _pieceToLaneId(piece);
         if (laneId) {
             const idx = DRUM_LANES.findIndex(l => l.id === laneId);
-            // If the custom-mapped lane is absent in the active preset (e.g. user
-            // mapped a note to 'tom2' then switched to rb4 which has no tom2), fall
-            // through to the preset-aware default rather than silently returning -1.
             if (idx >= 0) return idx;
         }
     }
-    return _midiToLane[midiNote] !== undefined ? _midiToLane[midiNote] : -1;
+    return -1;
 }
 
 function _songNoteToLaneIdx(midi) {
@@ -1495,15 +1619,35 @@ function _refreshAllMappingTables() {
     _refreshMapStatus();
 }
 
-async function _fetchJson(url, opts) {
-    if (typeof fetch !== 'function') return null;
+async function _fetchJsonResult(url, opts) {
+    if (typeof fetch !== 'function') return { ok: false, status: 0, data: null, detail: '' };
     try {
         const res = await fetch(url, opts);
-        if (!res || !res.ok) return null;
-        return await res.json();
+        const status = res && typeof res.status === 'number' ? res.status : 0;
+        let data = null;
+        try { data = res ? await res.json() : null; } catch (_) { data = null; }
+        const detail = data && typeof data.detail === 'string' ? data.detail : '';
+        return { ok: Boolean(res && res.ok), status: status, data: data, detail: detail };
     } catch (_) {
-        return null;
+        return { ok: false, status: 0, data: null, detail: '' };
     }
+}
+
+async function _fetchJson(url, opts) {
+    const result = await _fetchJsonResult(url, opts);
+    return result.ok ? result.data : null;
+}
+
+function _learnLockMessage() {
+    const ed = _getDrumEditor();
+    if (ed && typeof ed.learnLockMessage === 'function') return ed.learnLockMessage();
+    return 'Learn is locked while a song is playing or paused. Mapping was not changed.';
+}
+
+function _isLearnLockedStatus(status) {
+    const ed = _getDrumEditor();
+    if (ed && typeof ed.isLearnLockedStatus === 'function') return ed.isLearnLockedStatus(status);
+    return status === 409;
 }
 
 async function _refetchActiveKit() {
@@ -1555,17 +1699,23 @@ async function _commitLearnAssignment(midiNote, pieceId) {
     const kitId = _activeKitId;
     const prevMap = _cfg.customMapping;
     const prevNotes = _kitNotes;
-    const data = await _fetchJson(_noteEndpoint(kitId, n), {
+    const result = await _fetchJsonResult(_noteEndpoint(kitId, n), {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ piece_id: pieceId }),
     });
-    if (!data) {
+    if (!result.ok) {
         _cfg.customMapping = prevMap;
         _kitNotes = prevNotes;
-        _announceMapStatus('Could not save mapping. Kit and local map unchanged.', false);
+        _announceMapStatus(
+            _isLearnLockedStatus(result.status)
+                ? _learnLockMessage()
+                : 'Could not save mapping. Kit and local map unchanged.',
+            false,
+        );
         return null;
     }
+    const data = result.data;
     const applied = _applySuccessfulNoteMutation(data, n, pieceId, 'set');
     _notifyMappingChange({ kitId, mutation: 'set', midiNote: n });
     const name = _pieceDisplayName(pieceId);
@@ -1588,13 +1738,19 @@ async function _removeCustomNote(midiNote, pieceId) {
     const kitId = _activeKitId;
     const prevMap = _cfg.customMapping;
     const prevNotes = _kitNotes;
-    const data = await _fetchJson(_noteEndpoint(kitId, n), { method: 'DELETE' });
-    if (!data) {
+    const result = await _fetchJsonResult(_noteEndpoint(kitId, n), { method: 'DELETE' });
+    if (!result.ok) {
         _cfg.customMapping = prevMap;
         _kitNotes = prevNotes;
-        _announceMapStatus('Could not remove MIDI note ' + n + '. Mapping unchanged.', false);
+        _announceMapStatus(
+            _isLearnLockedStatus(result.status)
+                ? _learnLockMessage()
+                : 'Could not remove MIDI note ' + n + '. Mapping unchanged.',
+            false,
+        );
         return { ok: false };
     }
+    const data = result.data;
     const laneId = _pieceToLaneId(pieceId);
     _applySuccessfulNoteMutation(data, n, pieceId, 'delete');
     _lastRemoval = { kitId, midiNote: n, pieceId, laneId };
@@ -1614,17 +1770,21 @@ async function _undoLastRemoval() {
     if (last.kitId !== _activeKitId) return { ok: false };
     const prevMap = _cfg.customMapping;
     const prevNotes = _kitNotes;
-    const data = await _fetchJson(_noteEndpoint(last.kitId, last.midiNote), {
+    const result = await _fetchJsonResult(_noteEndpoint(last.kitId, last.midiNote), {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ piece_id: last.pieceId }),
     });
-    if (!data) {
+    if (!result.ok) {
         _cfg.customMapping = prevMap;
         _kitNotes = prevNotes;
-        _announceMapStatus('Could not undo. Mapping unchanged.', true);
+        _announceMapStatus(
+            _isLearnLockedStatus(result.status) ? _learnLockMessage() : 'Could not undo. Mapping unchanged.',
+            true,
+        );
         return { ok: false };
     }
+    const data = result.data;
     _applySuccessfulNoteMutation(data, last.midiNote, last.pieceId, 'set');
     const restored = last;
     _lastRemoval = null;
@@ -1659,6 +1819,7 @@ async function _confirmActiveKit(kitId) {
     _refreshKitSelects();
     _refreshAllMappingTables();
     _refreshKitSuggestBanners();
+    _persistEditorPatch();
     return true;
 }
 
@@ -1683,8 +1844,8 @@ function _refreshKitSelects() {
         else sel.value = '';
     }
     document.querySelectorAll('.drums-kit-confirm').forEach(btn => {
-        const sel = btn.closest('.drums-settings-panel')
-            && btn.closest('.drums-settings-panel').querySelector('.drums-kit-select');
+        const panel = btn.closest('.drums-editor') || btn.closest('.drums-settings-panel');
+        const sel = panel && panel.querySelector('.drums-kit-select');
         const chosen = sel ? sel.value : '';
         btn.disabled = !chosen || chosen === _activeKitId;
     });
@@ -1797,6 +1958,142 @@ function _wireKitControls(scope) {
     _refreshKitSelects();
     _refreshKitSuggestBanners();
 }
+
+function _collectProfilePatch() {
+    return {
+        highway: {
+            '2d': {
+                lane_preset: _cfg.lanePreset,
+                show_lane_labels: _cfg.showLaneLabels,
+            },
+        },
+    };
+}
+
+function _persistEditorPatch() {
+    const editor = _getDrumEditor();
+    if (!editor || typeof editor.persistActivePatch !== 'function') return;
+    editor.persistActivePatch(_collectProfilePatch());
+}
+
+function _syncEditorControlsFromCfg() {
+    if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') return;
+    document.querySelectorAll('.drums-vol-slider').forEach(el => {
+        el.value = String(Math.round(_cfg.synthVolume * 100));
+    });
+    document.querySelectorAll('.drums-channel-select').forEach(el => {
+        el.value = String(_cfg.midiChannel);
+    });
+    document.querySelectorAll('.drums-chk-hits').forEach(el => {
+        el.checked = Boolean(_cfg.hitDetection);
+    });
+    document.querySelectorAll('.drums-chk-labels').forEach(el => {
+        el.checked = Boolean(_cfg.showLaneLabels);
+    });
+    document.querySelectorAll('.drums-lane-preset').forEach(el => {
+        el.value = _cfg.lanePreset;
+    });
+}
+
+function _applyDrumProfile(profile) {
+    if (!profile || typeof profile !== 'object') return;
+    const apply = function () {
+        const hw2d = profile.highway && profile.highway['2d'] ? profile.highway['2d'] : {};
+        if (hw2d.lane_preset && _VALID_LANE_PRESETS.has(hw2d.lane_preset)) {
+            _saveCfg('lanePreset', hw2d.lane_preset);
+            _applyLanePreset(_cfg.lanePreset);
+            _cfg.learnLane = null;
+            _cfg.learnPiece = null;
+        }
+        if (typeof hw2d.show_lane_labels === 'boolean') _saveCfg('showLaneLabels', hw2d.show_lane_labels);
+        const deviceId = _normalizeAttachedDeviceId(profile.device_id);
+        if (deviceId) _refetchAttachedDevice(deviceId);
+        else _clearAttachedDevice();
+        _syncEditorControlsFromCfg();
+    };
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(apply);
+    else apply();
+}
+
+function _hydrateDrumEditor(root) {
+    if (!root || typeof root.querySelector !== 'function') return;
+    const preset = root.querySelector('.drums-lane-preset');
+    if (preset) {
+        preset.onchange = function () {
+            _saveCfg('lanePreset', this.value);
+            _applyLanePreset(_cfg.lanePreset);
+            _cfg.learnLane = null;
+            _cfg.learnPiece = null;
+            if (typeof document !== 'undefined' && document.querySelectorAll) {
+                document.querySelectorAll('.drums-lane-preset').forEach(sel => {
+                    sel.value = _cfg.lanePreset;
+                });
+            }
+            _persistEditorPatch();
+        };
+    }
+    const labels = root.querySelector('.drums-chk-labels');
+    if (labels) {
+        labels.onchange = function () {
+            _saveCfg('showLaneLabels', this.checked);
+            _persistEditorPatch();
+        };
+    }
+    _bindDrumInputContract();
+    _bindMidiDeviceScoring();
+    _syncEditorControlsFromCfg();
+    const editor = _getDrumEditor();
+    if (editor && typeof editor.refreshProfiles === 'function') {
+        editor.refreshProfiles().then(function (cache) {
+            const id = cache && cache.active && cache.active.device_id;
+            if (id) _refetchAttachedDevice(id);
+            else _clearAttachedDevice();
+        });
+    }
+}
+
+function _onDrumProfileChange(ev) {
+    const detail = (ev && ev.detail) || ev || {};
+    const editor = _getDrumEditor();
+    const apply = function (profile) {
+        if (profile) _applyDrumProfile(profile);
+    };
+    // Do not refreshProfiles() here: that rebuilds the Attach select and
+    // races the in-flight save (flash back to None). Scoring overlay only.
+    if (editor && typeof editor.listProfiles === 'function' && detail.profile_id) {
+        editor.listProfiles().then(function (list) {
+            const hit = (list || []).find(function (p) { return p.id === detail.profile_id; });
+            apply(hit);
+        });
+        return;
+    }
+}
+
+function _bootSettingsEditor() {
+    _ensureDrumEditor(function (editor) {
+        if (!editor || typeof document === 'undefined' || typeof document.querySelector !== 'function') return;
+        const host = document.querySelector('[data-drums-editor-host="settings"]');
+        if (!host) return;
+        editor.mountDrumEditor(host, {
+            context: 'settings',
+            onMounted: _hydrateDrumEditor,
+            synthVolume: _cfg.synthVolume,
+            midiChannel: _cfg.midiChannel,
+            hitDetection: _cfg.hitDetection,
+            showLaneLabels: _cfg.showLaneLabels,
+            lanePreset: _cfg.lanePreset,
+        });
+    });
+    if (typeof document !== 'undefined' && document.addEventListener && !window.__feedBackDrumsProfileHook) {
+        window.__feedBackDrumsProfileHook = true;
+        document.addEventListener('feedback:drum-profile-change', _onDrumProfileChange);
+        const fb = window.feedBack;
+        if (fb && typeof fb.on === 'function') fb.on('feedback:drum-profile-change', _onDrumProfileChange);
+    }
+    _bindMidiDeviceScoring();
+}
+
+if (typeof document !== 'undefined') _bootSettingsEditor();
 
 // ═══════════════════════════════════════════════════════════════════════
 // Splitscreen helper wrappers
@@ -1919,10 +2216,8 @@ function createFactory() {
     let _drumCtx = null;
     let _highwayCanvas = null;
 
-    // Settings UI
-    let _settingsPanel = null;
+    // Settings UI — gear opens the shared editor (INIT-003/SPEC-005).
     let _settingsGear = null;
-    let _settingsVisible = false;
 
     // Held / flash state — per-instance so each panel only shows the
     // pads ITS focused user is hitting.
@@ -2222,16 +2517,16 @@ function createFactory() {
         gear.className = 'btn-drums-settings px-2 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-400 transition';
         gear.dataset.drumsInstance = String(_instanceId);
         gear.type = 'button';
-        gear.title = 'Drum settings (MIDI, sounds, scoring)';
+        gear.title = 'Open drum settings';
         // Accessible name for screen readers — title alone is announced
         // inconsistently, and the glyph itself would otherwise surface
         // as "black gear" or similar ambiguous text.
-        gear.setAttribute('aria-label', 'Drum settings');
+        gear.setAttribute('aria-label', 'Open drum settings');
         const glyph = document.createElement('span');
         glyph.setAttribute('aria-hidden', 'true');
         glyph.textContent = '⚙';
         gear.appendChild(glyph);
-        gear.onclick = _toggleSettings;
+        gear.onclick = _openPauseDrumSettings;
 
         if (_ssActive()) {
             // Splitscreen: append to the panel bar.
@@ -2259,177 +2554,29 @@ function createFactory() {
         }
     }
 
-    function _toggleSettings() {
-        _settingsVisible = !_settingsVisible;
-        if (!_settingsPanel && _settingsVisible) _createSettingsPanel();
-        if (_settingsPanel) _settingsPanel.style.display = _settingsVisible ? '' : 'none';
-        if (_settingsVisible) {
+    function _openPauseDrumSettings() {
+        _ensureDrumEditor(function (editor) {
+            if (!editor || typeof editor.openPauseDrumEditor !== 'function') return;
             _midiInit();
             _synthInit();
-            _midiUpdateAllDeviceLists();
-        }
-    }
-
-    function _createSettingsPanel() {
-        if (_settingsPanel) return;
-        const panelChrome = _ssPanelChrome(_highwayCanvas);
-        const mount = panelChrome || document.getElementById('player');
-        if (!mount) return;
-
-        const panel = document.createElement('div');
-        panel.className = 'drums-settings-panel';
-        panel.dataset.drumsInstance = String(_instanceId);
-        panel.style.cssText = 'position:absolute;top:0;left:0;right:0;z-index:50;pointer-events:auto;' +
-            'background:rgba(8,8,20,0.94);border-bottom:1px solid #222;padding:6px 12px;' +
-            'font-family:system-ui,sans-serif;display:none;max-height:50%;overflow-y:auto;';
-
-        const channelOpts = '<option value="-1"' + (_cfg.midiChannel === -1 ? ' selected' : '') + '>All</option>' +
-            '<option value="9"' + (_cfg.midiChannel === 9 ? ' selected' : '') + '>10 (Drums)</option>' +
-            Array.from({length: 16}, (_, i) =>
-                i === 9 ? '' : `<option value="${i}"${_cfg.midiChannel === i ? ' selected' : ''}>${i + 1}</option>`
-            ).join('');
-
-        // All form controls use classes (not ids) so N panels don't
-        // collide on getElementById lookups. Handlers bind via
-        // panel.querySelector scoped to this specific panel.
-        panel.innerHTML = `
-            <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:6px;">
-                <div style="display:flex;align-items:center;gap:4px;">
-                    <span style="font-size:10px;color:#666;">MIDI</span>
-                    <select class="drums-midi-select" style="background:#1a1a2e;border:1px solid #333;border-radius:6px;
-                        padding:3px 6px;font-size:11px;color:#ccc;outline:none;max-width:180px;">
-                        <option value="">None</option>
-                    </select>
-                </div>
-                <div style="display:flex;align-items:center;gap:4px;">
-                    <span style="font-size:10px;color:#666;">Vol</span>
-                    <input type="range" class="drums-vol-slider" min="0" max="100"
-                        value="${Math.round(_cfg.synthVolume * 100)}"
-                        style="width:70px;accent-color:#ef4444;height:14px;">
-                </div>
-                <div style="display:flex;align-items:center;gap:4px;">
-                    <span style="font-size:10px;color:#666;">Ch</span>
-                    <select class="drums-channel-select" style="background:#1a1a2e;border:1px solid #333;border-radius:6px;
-                        padding:3px 6px;font-size:11px;color:#ccc;outline:none;width:72px;">
-                        ${channelOpts}
-                    </select>
-                </div>
-                <label style="display:flex;align-items:center;gap:4px;font-size:10px;color:#666;">
-                    Lanes
-                    <select class="drums-lane-preset" aria-label="Lane preset"
-                        style="background:#1a1a2e;border:1px solid #333;border-radius:6px;
-                        padding:3px 6px;font-size:11px;color:#ccc;outline:none;width:110px;">
-                        <option value="phase_shift_8"${_cfg.lanePreset === 'phase_shift_8' ? ' selected' : ''}>Phase Shift 8</option>
-                        <option value="rb4"${_cfg.lanePreset === 'rb4' ? ' selected' : ''}>Rock Band</option>
-                    </select>
-                </label>
-                <label style="display:flex;align-items:center;gap:3px;font-size:11px;color:#999;cursor:pointer;">
-                    <input type="checkbox" class="drums-chk-labels" ${_cfg.showLaneLabels ? 'checked' : ''}
-                        style="accent-color:#ef4444;"> Labels
-                </label>
-                <label style="display:flex;align-items:center;gap:3px;font-size:11px;color:#999;cursor:pointer;">
-                    <input type="checkbox" class="drums-chk-hits" ${_cfg.hitDetection ? 'checked' : ''}
-                        style="accent-color:#22cc66;"> Hits
-                </label>
-                <button class="drums-reset-map" style="background:#1a1a2e;border:1px solid #333;border-radius:4px;
-                    padding:2px 8px;font-size:10px;color:#aaa;cursor:pointer;">Reset Map</button>
-            </div>
-            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:4px;">
-                <label style="display:flex;align-items:center;gap:4px;font-size:10px;color:#666;">
-                    Kit
-                    <select class="drums-kit-select" aria-label="Drum kit"
-                        style="background:#1a1a2e;border:1px solid #333;border-radius:6px;
-                        padding:3px 6px;font-size:11px;color:#ccc;outline:none;max-width:180px;">
-                    </select>
-                </label>
-                <button type="button" class="drums-kit-confirm" aria-label="Use this kit"
-                    style="background:#1a1a2e;border:1px solid #555;border-radius:4px;
-                    padding:2px 8px;font-size:10px;color:#ddd;cursor:pointer;">Use this kit</button>
-            </div>
-            <div class="drums-kit-suggest" role="status" hidden
-                style="font-size:10px;color:#ccc;margin-bottom:4px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;"></div>
-            <details style="margin-top:2px;">
-                <summary style="font-size:10px;color:#666;cursor:pointer;">MIDI Mapping</summary>
-                <div class="drums-map-status" role="status" aria-live="polite"
-                    style="font-size:10px;color:#ccc;margin:4px 0;min-height:1.2em;"></div>
-                <table class="drums-map-table" style="font-size:11px;margin-top:4px;">${_buildMappingRows()}</table>
-            </details>`;
-
-        if (panelChrome) {
-            panelChrome.appendChild(panel);
-        } else {
-            const controls = document.getElementById('player-controls');
-            if (controls && controls.parentNode === mount) mount.insertBefore(panel, controls);
-            else mount.appendChild(panel);
-        }
-        _settingsPanel = panel;
-
-        panel.querySelector('.drums-midi-select').onchange = function () {
-            if (_applyingSharedSettings) return;
-            _midiConnect(this.value);
-            _synthInit();
-            _setSharedSetting({ deviceEnabled: Boolean(this.value) });
-        };
-        panel.querySelector('.drums-vol-slider').oninput = function () {
-            if (_applyingSharedSettings) return;
-            _synthSetVolume(parseInt(this.value) / 100);
-        };
-        panel.querySelector('.drums-channel-select').onchange = function () {
-            if (_applyingSharedSettings) return;
-            _setSharedSetting({ midiChannel: parseInt(this.value) });
-        };
-        panel.querySelector('.drums-lane-preset').onchange = function () {
-            _saveCfg('lanePreset', this.value);
-            // Rebuild DRUM_LANES + _midiToLane in place (mutated arrays,
-            // not reassigned) so existing geometry closures keep their
-            // references. _refreshAllMappingTables() re-renders every open
-            // panel's lane rows so Learn-mode data-lane indexes stay correct
-            // after the preset change; also sync all preset selectors so a
-            // second open panel reflects the new choice.
-            _applyLanePreset(_cfg.lanePreset);
-            // Clear the Learn-mode lane sentinel: the lane count may have
-            // changed, so a stale _cfg.learnLane could index beyond DRUM_LANES
-            // bounds in _handleDrumHit() or remap into the wrong lane.
-            _cfg.learnLane = null;
-            _cfg.learnPiece = null;
-            document.querySelectorAll('.drums-lane-preset').forEach(sel => {
-                sel.value = _cfg.lanePreset;
+            editor.openPauseDrumEditor({
+                onMounted: _hydrateDrumEditor,
+                trapFocus: typeof window !== 'undefined' ? window._trapFocusInModal : null,
+                synthVolume: _cfg.synthVolume,
+                midiChannel: _cfg.midiChannel,
+                hitDetection: _cfg.hitDetection,
+                showLaneLabels: _cfg.showLaneLabels,
+                lanePreset: _cfg.lanePreset,
             });
-            _refreshAllMappingTables();
-        };
-        panel.querySelector('.drums-chk-labels').onchange = function () {
-            _saveCfg('showLaneLabels', this.checked);
-        };
-        panel.querySelector('.drums-chk-hits').onchange = function () {
-            if (_applyingSharedSettings) return;
-            _setSharedSetting({ hitDetection: this.checked });
-            if (this.checked) _resetScoring();
-        };
-        panel.querySelector('.drums-reset-map').onclick = function () {
-            _saveCfg('customMapping', null);
-            // Rebuild the mapping table inline so the `<details>`
-            // open state and panel scroll position survive the
-            // reset. customMapping is module-shared, so refresh
-            // EVERY open settings panel's table — not just this
-            // one — to keep splitscreen UIs consistent.
-            _refreshAllMappingTables();
-            _midiUpdateAllDeviceLists();
-        };
-
-        _wireMappingControls(panel);
-        _refreshMapStatus();
-        _wireKitControls(panel);
-        _midiUpdateAllDeviceLists();
-        _bindDrumInputContract();
-        _consumeCoreKits();
+        });
     }
 
     function _removeSettingsPanel() {
-        if (_settingsPanel) {
-            _settingsPanel.remove();
-            _settingsPanel = null;
+        const editor = _getDrumEditor();
+        const mounted = editor && editor.getMountedEditor && editor.getMountedEditor();
+        if (mounted && mounted.context === 'pause' && editor.unmountDrumEditor) {
+            editor.unmountDrumEditor();
         }
-        _settingsVisible = false;
     }
 
     // ── Canvas sizing ──
@@ -2968,6 +3115,7 @@ function createFactory() {
             _midiInit();
             _synthInit();
             _bindDrumInputContract();
+            _bindMidiDeviceScoring();
             _consumeCoreKits();
 
             _isReady = true;
@@ -3086,6 +3234,7 @@ function createFactory() {
         // Internal hooks used by module-level MIDI router + device-swap.
         _handleDrumHit,
         _releaseAllSounding,
+        _resetScoring,
     };
 
     return instance;
@@ -3159,6 +3308,30 @@ if (typeof module !== 'undefined' && module.exports) {
         _saveCfg,
         _cfg,
         _knownPieces,
+        // INIT-003/SPEC-005
+        mountDrumEditor: function (host, opts) {
+            const editor = _getDrumEditor();
+            return editor ? editor.mountDrumEditor(host, Object.assign({ onMounted: _hydrateDrumEditor }, opts || {})) : null;
+        },
+        unmountDrumEditor: function () {
+            const editor = _getDrumEditor();
+            if (editor) editor.unmountDrumEditor();
+        },
+        _getDrumEditor, _hydrateDrumEditor, _collectProfilePatch, _applyDrumProfile,
+        _bootSettingsEditor, _learnLockMessage, _isLearnLockedStatus, _fetchJsonResult,
+        _persistEditorPatch, _onDrumProfileChange,
+        _refetchAttachedDevice, _applyDeviceNotes, _clearAttachedDevice, _onMidiDeviceChange,
+        _bindMidiDeviceScoring, _normalizeAttachedDeviceId,
+        _getAttachedDeviceId() { return _attachedDeviceId; },
+        _getDeviceNotes() { return _deviceNotes; },
+        _setAttachedDevice(id, device) {
+            _attachedDeviceId = _normalizeAttachedDeviceId(id);
+            if (!_attachedDeviceId) {
+                _deviceNotes = null;
+                return;
+            }
+            _applyDeviceNotes(device || null);
+        },
     };
 }
 

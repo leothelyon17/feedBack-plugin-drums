@@ -48,41 +48,41 @@ test('_validatePieceMapping skips unknown piece-ids (untrusted kit JSON)', () =>
     assert.equal(parsed[38], undefined);
 });
 
-test('ac-1: unset active_kit + valid legacy map scores like pre-change Learn', () => {
+test('ac-1: empty device_id leaves MIDI hits unmapped (legacy map is not scoring SoT)', () => {
     const mod = freshPlugin();
     mod._saveCfg('customMapping', { 38: 'kick', 36: 'snare' });
-    const kick = mod.DRUM_LANES.findIndex(l => l.id === 'kick');
+    assert.equal(mod._midiToLaneIdx(38), -1);
+    assert.equal(mod._midiToLaneIdx(36), -1);
     const snare = mod.DRUM_LANES.findIndex(l => l.id === 'snare');
-    assert.equal(mod._midiToLaneIdx(38), kick);
-    assert.equal(mod._midiToLaneIdx(36), snare);
+    assert.equal(mod._songNoteToLaneIdx(38), snare);
 });
 
-test('ac-2: active_kit piece-id map wins over GM collision', () => {
+test('ac-2: attached MIDI device notes are scoring SoT over GM', () => {
     const mod = freshPlugin();
     mod._applyLanePreset('phase_shift_8');
     const snare = mod.DRUM_LANES.findIndex(l => l.id === 'snare');
     const tom1 = mod.DRUM_LANES.findIndex(l => l.id === 'tom1');
-    assert.equal(mod._midiToLaneIdx(38), snare);
-    mod._applyActiveKitNotes({ notes: { '38': 'tom_hi' } });
+    assert.equal(mod._midiToLaneIdx(38), -1);
+    mod._setAttachedDevice('pad-1', { notes: { '38': 'tom_hi' } });
     assert.equal(mod._midiToLaneIdx(38), tom1);
     assert.notEqual(mod._midiToLaneIdx(38), snare);
 });
 
-test('dual-read: active_kit wins over a legacy customMapping on the same note', () => {
+test('device notes win over a leftover customMapping on the same note', () => {
     const mod = freshPlugin();
     mod._saveCfg('customMapping', { 38: 'kick' });
-    const kick = mod.DRUM_LANES.findIndex(l => l.id === 'kick');
     const tom1 = mod.DRUM_LANES.findIndex(l => l.id === 'tom1');
-    assert.equal(mod._midiToLaneIdx(38), kick);
-    mod._applyActiveKitNotes({ notes: { '38': 'tom_hi' } });
+    assert.equal(mod._midiToLaneIdx(38), -1);
+    mod._setAttachedDevice('pad-1', { notes: { '38': 'tom_hi' } });
     assert.equal(mod._midiToLaneIdx(38), tom1);
 });
 
-test('empty kit notes fall through to GM', () => {
+test('empty device notes stay unmapped (no GM fallback for pad hits)', () => {
     const mod = freshPlugin();
-    mod._applyActiveKitNotes({ notes: {} });
+    mod._setAttachedDevice('pad-1', { notes: {} });
+    assert.equal(mod._midiToLaneIdx(38), -1);
     const snare = mod.DRUM_LANES.findIndex(l => l.id === 'snare');
-    assert.equal(mod._midiToLaneIdx(38), snare);
+    assert.equal(mod._songNoteToLaneIdx(38), snare);
 });
 
 test('rb4 piece map has no tom2 lane', () => {
