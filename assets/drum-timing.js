@@ -1,6 +1,9 @@
 // INIT-004/SPEC-002: Calibration module (inline MIDI panel + overlay).
 // One render entry, two mounts. Persist only via midiDevices.writeTiming.
 // Getter clamps |offset| to 250. Never writes the visual A/V offset or plugin store keys.
+if (typeof require === 'function') {
+    try { require('./drum-timing-debug.js'); } catch (_) {}
+}
 (function (root) {
 'use strict';
 
@@ -10,6 +13,8 @@ var FAIL_COPY = 'Hits were too scattered';
 var EMPTY_COPY = 'Not set';
 var BPM = 120;
 var VERSION = 1;
+var COUNT_IN_BEATS = 4;
+var WARMUP_DISCARD = 3;
 
 var _inlineHost = null;
 var _overlay = null;
@@ -22,10 +27,13 @@ var _clickTimer = null;
 var _clickCtx = null;
 var _clickStartedAt = 0;
 var _clickStartedMs = 0;
+var _clickBeat = 0;
 var _listenersBound = false;
 var _remeasureOpen = false;
 var _suggestedAvailable = null;
 var _lastWrite = null;
+var _warmupLeft = 0;
+var _locking = false;
 
 function _fb() {
     if (typeof window === 'undefined') return null;
@@ -157,6 +165,38 @@ function isFailCode(code) {
     return typeof code === 'string' && code.indexOf('fail_') === 0;
 }
 
+function failCopy(code) {
+    if (code === 'fail_n') return 'Need more hits on the click';
+    if (code === 'fail_mad') return FAIL_COPY;
+    if (code === 'fail_verify') return 'Last hits did not hold the measured offset';
+    if (code === 'fail_bimodal') return 'Hits split into two timing clusters';
+    if (code === 'fail_range') return 'Measured offset was out of range';
+    return FAIL_COPY;
+}
+
+function _debugApi() {
+    if (typeof window === 'undefined') return null;
+    return window.feedBackDrumDebug || null;
+}
+
+function _calibClockSource() {
+    if (_clickCtx && typeof _clickCtx.currentTime === 'number') return 'audioctx';
+    var hw = typeof window !== 'undefined' ? window.highway : null;
+    if (hw && typeof hw.getTime === 'function') return 'highway';
+    return 'performance';
+}
+
+function _recordCalib(summary, source) {
+    var dbg = _debugApi();
+    if (!dbg || typeof dbg.recordCalibration !== 'function') return;
+    dbg.recordCalibration(summary, _session, {
+        clock_source: _calibClockSource(),
+        origin: currentOrigin(),
+        audio_backend: currentAudioBackend(),
+        source: source || 'auto',
+    });
+}
+
 function formatOffsetLabel(timing) {
     if (!timing) return EMPTY_COPY;
     var n = clampOffset(timing.offset_ms);
@@ -269,6 +309,7 @@ function _hook(root, name) {
     if (root.getAttribute && root.getAttribute('data-dt') === name) return root;
     var kids = root.children || [];
     for (var i = 0; i < kids.length; i += 1) {
+        if (!kids[i] || typeof kids[i].getAttribute !== 'function') continue;
         var found = _hook(kids[i], name);
         if (found) return found;
     }
@@ -308,12 +349,13 @@ function _calibClock() {
 
 function _stopClick() {
     if (_clickTimer != null) {
+        try { clearTimeout(_clickTimer); } catch (_) { /* ignore */ }
         try { clearInterval(_clickTimer); } catch (_) { /* ignore */ }
         _clickTimer = null;
     }
 }
 
-function _beep() {
+function _beepAt(when) {
     if (!_clickCtx || typeof _clickCtx.createOscillator !== 'function') return;
     try {
         var osc = _clickCtx.createOscillator();
@@ -322,13 +364,42 @@ function _beep() {
         gain.gain.value = 0.08;
         osc.connect(gain);
         gain.connect(_clickCtx.destination);
-        osc.start();
-        osc.stop(_clickCtx.currentTime + 0.04);
+        var t = Number(when);
+        if (!Number.isFinite(t)) t = _clickCtx.currentTime;
+        osc.start(t);
+        osc.stop(t + 0.04);
     } catch (_) { /* audio optional */ }
+}
+
+function _beep() {
+    _beepAt(_clickCtx && typeof _clickCtx.currentTime === 'number' ? _clickCtx.currentTime : 0);
+    if (_measuring) _paintAll();
+}
+
+function _clickPeriodSec() {
+    return 60 / BPM;
+}
+
+function _scheduleClicks() {
+    if (!_measuring || !_clickCtx || typeof _clickCtx.currentTime !== 'number') return;
+    if (typeof _clickCtx.createOscillator !== 'function') return;
+    var period = _clickPeriodSec();
+    var now = _clickCtx.currentTime;
+    var horizon = now + 0.25;
+    var scheduled = 0;
+    while (_clickStartedAt + _clickBeat * period <= horizon) {
+        var when = _clickStartedAt + _clickBeat * period;
+        if (when >= now - 0.002) _beepAt(when);
+        _clickBeat += 1;
+        scheduled += 1;
+    }
+    if (scheduled && _measuring) _paintAll();
+    if (_measuring) _clickTimer = setTimeout(_scheduleClicks, 50);
 }
 
 function _startClick() {
     _stopClick();
+    _clickBeat = 0;
     _clickStartedMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
     _clickStartedAt = 0;
     try {
@@ -341,9 +412,26 @@ function _startClick() {
     } catch (_) {
         _clickCtx = null;
     }
+    if (_clickCtx && typeof _clickCtx.createOscillator === 'function') {
+        _scheduleClicks();
+        return;
+    }
     var period = 60000 / BPM;
     _beep();
     _clickTimer = setInterval(_beep, period);
+}
+
+function _leadInEnabled() {
+    return !!(_clickCtx && typeof _clickCtx.currentTime === 'number');
+}
+
+function _countInSec() {
+    if (!_leadInEnabled()) return 0;
+    return COUNT_IN_BEATS * (60 / BPM);
+}
+
+function _inCountIn() {
+    return _measuring && _calibClock() < _countInSec();
 }
 
 function _minTaps() {
@@ -368,10 +456,13 @@ function _uiState() {
         offsetLabel: formatOffsetLabel(timing),
         remasure: remasure,
         measuring: _measuring,
+        countIn: _inCountIn(),
+        warmupLeft: _warmupLeft,
+        locking: _locking,
         tapCount: n,
         tapNeed: need,
         summary: _lastSummary,
-        fail: _lastSummary && !_lastSummary.accepted && isFailCode(_lastSummary.code),
+        fail: !_measuring && _lastSummary && !_lastSummary.accepted && isFailCode(_lastSummary.code),
         hasDevice: !!(device && device.id),
     };
 }
@@ -383,12 +474,21 @@ function _paintView(view) {
     _setText(_hook(view.root, 'offset'), ui.offsetLabel);
     _setHidden(_hook(view.root, 'remeasure'), !ui.remasure);
     _setHidden(_hook(view.root, 'gate'), !ui.fail);
-    if (ui.fail) _setText(_hook(view.root, 'gate-msg'), FAIL_COPY);
+    if (ui.fail) _setText(_hook(view.root, 'gate-msg'), failCopy(ui.summary && ui.summary.code));
+    var dbg = _debugApi();
+    var debugOn = dbg && typeof dbg.isEnabled === 'function' && dbg.isEnabled();
+    _setHidden(_hook(view.root, 'debug-copy'), !debugOn);
     _setHidden(_hook(view.root, 'save-anyway'), !ui.fail);
-    _setText(_hook(view.root, 'progress'), ui.measuring
-        ? (ui.tapCount + ' / ' + ui.tapNeed + ' hits')
-        : '');
+    var progress = '';
+    if (ui.measuring) {
+        if (ui.countIn) progress = 'Listen — counting in';
+        else if (ui.warmupLeft > 0) progress = 'Lock in — ' + ui.warmupLeft + ' more';
+        else if (ui.locking) progress = 'Keep hitting — locking in';
+        else progress = ui.tapCount + ' / ' + ui.tapNeed + ' hits';
+    }
+    _setText(_hook(view.root, 'progress'), progress);
     _setHidden(_hook(view.root, 'retry'), !ui.fail);
+    _setHidden(_hook(view.root, 'stop'), !ui.measuring);
     _setHidden(_hook(view.root, 'start'), ui.measuring || ui.fail);
     var sug = _hook(view.root, 'suggested');
     if (sug) {
@@ -434,12 +534,34 @@ function _bindView(view) {
     }
     on('start', function () { startMeasure(); });
     on('retry', function () { startMeasure(); });
+    on('stop', function () { stopMeasure(); });
     on('save-anyway', function () { saveAnyway(); });
     on('manual-save', function () { saveManual(view); });
     on('suggested', function () { openSuggestedChart(); });
     on('skip', function () { closeOverlay(); });
     on('continue', function () { closeOverlay(); });
     on('remeasure-go', function () { startMeasure(); });
+    var debugCb = _hook(root, 'debug-capture');
+    if (debugCb) {
+        var onDebugToggle = function () {
+            var dbg = _debugApi();
+            if (dbg && typeof dbg.setEnabled === 'function') dbg.setEnabled(!!debugCb.checked);
+            _paintAll();
+        };
+        debugCb.onchange = onDebugToggle;
+        if (typeof debugCb.addEventListener === 'function') debugCb.addEventListener('change', onDebugToggle);
+    }
+    on('debug-copy', function () {
+        var dbg = _debugApi();
+        if (!dbg || typeof dbg.snapshot !== 'function') return;
+        try {
+            var snap = dbg.snapshot();
+            var nav = typeof navigator !== 'undefined' ? navigator : null;
+            if (nav && nav.clipboard && typeof nav.clipboard.writeText === 'function') {
+                nav.clipboard.writeText(JSON.stringify(snap, null, 2));
+            }
+        } catch (_) { /* clipboard optional */ }
+    });
 }
 
 function renderInto(host, opts) {
@@ -490,6 +612,7 @@ function renderInto(host, opts) {
     var actions = _el('div', { className: 'drums-timing-actions', dt: 'actions' });
     actions.appendChild(_el('button', { type: 'button', className: 'drums-timing-btn drums-timing-btn-primary', dt: 'start', text: 'Start' }));
     actions.appendChild(_el('button', { type: 'button', className: 'drums-timing-btn drums-timing-btn-primary', dt: 'retry', text: 'Retry' }));
+    actions.appendChild(_el('button', { type: 'button', className: 'drums-timing-btn drums-timing-btn-ghost', dt: 'stop', text: 'Stop' }));
     actions.appendChild(_el('button', { type: 'button', className: 'drums-timing-btn drums-timing-btn-secondary', dt: 'save-anyway', text: 'Save anyway' }));
     root.appendChild(actions);
 
@@ -504,7 +627,22 @@ function renderInto(host, opts) {
     manual.appendChild(_el('button', { type: 'button', className: 'drums-timing-btn', dt: 'manual-save', text: 'Save' }));
     root.appendChild(manual);
 
-    var hint = _el('p', { className: 'drums-timing-hint', dt: 'hint', text: 'Hit any mapped pad on the click. If the map is empty, any pad works.' });
+    var debugWrap = _el('div', { className: 'drums-timing-debug-wrap', dt: 'debug-wrap' });
+    var debugLabel = _el('label', { className: 'drums-timing-debug' });
+    var debugCb = _el('input', { type: 'checkbox', dt: 'debug-capture', label: 'Record timing debug' });
+    debugLabel.appendChild(debugCb);
+    debugLabel.appendChild(_el('span', { text: ' Record timing debug (local only)' }));
+    debugWrap.appendChild(debugLabel);
+    debugWrap.appendChild(_el('button', {
+        type: 'button',
+        className: 'drums-timing-btn',
+        dt: 'debug-copy',
+        text: 'Copy debug JSON',
+        hidden: true,
+    }));
+    root.appendChild(debugWrap);
+
+    var hint = _el('p', { className: 'drums-timing-hint', dt: 'hint', text: 'Listen to the count-in, then hit any mapped pad with the click. Notes only score in play when Hit detection is on (MIDI → Input).' });
     root.appendChild(hint);
 
     var suggested = _el('button', { type: 'button', className: 'drums-timing-btn drums-timing-suggested', dt: 'suggested', text: 'Open suggested chart' });
@@ -533,11 +671,13 @@ function _dropView(view) {
 function startMeasure() {
     var tap = tapToBeat();
     _lastSummary = null;
+    _locking = false;
     _measuring = true;
     _session = tap && tap.session && typeof tap.session.create === 'function'
         ? tap.session.create()
         : { taps: [] };
     _startClick();
+    _warmupLeft = _leadInEnabled() ? WARMUP_DISCARD : 0;
     _listenMidi(true);
     _paintBeat(0);
     _paintAll();
@@ -550,29 +690,48 @@ function stopMeasure() {
     _paintAll();
 }
 
+function _tapResidual(timeStamp) {
+    var tap = tapToBeat();
+    var conv = tap && typeof tap.convert === 'function'
+        ? tap.convert(timeStamp, { getTime: _calibClock })
+        : { tChart: _calibClock() };
+    var tChart = conv && Number.isFinite(conv.tChart) ? conv.tChart : _calibClock();
+    if (tap && typeof tap.nearestBeat === 'function') {
+        var near = tap.nearestBeat(tChart, { bpm: BPM, originT: 0 });
+        if (near && Number.isFinite(near.residualMs)) return { tChart: tChart, residualMs: near.residualMs, beatT: near.beatT };
+    }
+    return { tChart: tChart, residualMs: 0, beatT: 0 };
+}
+
 function handleNoteOn(note, timeStamp) {
     if (!_measuring) return { ok: false, reason: 'idle' };
     var device = activeDevice();
     if (!noteAllowed(note, device)) return { ok: false, reason: 'unmapped' };
     var tap = tapToBeat();
     if (!tap) return { ok: false, reason: 'no-tapToBeat' };
+    var peek = _tapResidual(timeStamp);
+    if (_inCountIn()) {
+        _paintBeat(peek.residualMs);
+        _paintAll();
+        return { ok: false, reason: 'count-in', residualMs: peek.residualMs, n: 0 };
+    }
+    if (_warmupLeft > 0) {
+        _warmupLeft -= 1;
+        _paintBeat(peek.residualMs);
+        _paintAll();
+        return { ok: false, reason: 'warmup', residualMs: peek.residualMs, remaining: _warmupLeft, n: 0 };
+    }
     if (!_session) _session = tap.session && tap.session.create ? tap.session.create() : { taps: [] };
-    var conv = typeof tap.convert === 'function'
-        ? tap.convert(timeStamp, { getTime: _calibClock })
-        : { tChart: _calibClock() };
-    var tChart = conv && Number.isFinite(conv.tChart) ? conv.tChart : _calibClock();
+    var tChart = peek.tChart;
     if (tap.session && typeof tap.session.record === 'function') {
         tap.session.record(_session, tChart, { bpm: BPM, originT: 0 });
     } else if (tap.session && typeof tap.session.add === 'function') {
-        var hit = typeof tap.nearestBeat === 'function'
-            ? tap.nearestBeat(tChart, { bpm: BPM, originT: 0 })
-            : { residualMs: 0 };
-        tap.session.add(_session, hit);
+        tap.session.add(_session, peek);
     }
     var last = _session.taps && _session.taps.length
         ? _session.taps[_session.taps.length - 1]
         : null;
-    var residual = last && Number.isFinite(last.residualMs) ? last.residualMs : 0;
+    var residual = last && Number.isFinite(last.residualMs) ? last.residualMs : peek.residualMs;
     _paintBeat(residual);
     _maybeGate();
     _paintAll();
@@ -581,10 +740,16 @@ function handleNoteOn(note, timeStamp) {
 
 function _maybeGate() {
     if (!_session || !_session.taps) return;
-    if (_session.taps.length < _minTaps()) return;
+    var need = _minTaps();
+    if (_session.taps.length > need) {
+        _session.taps = _session.taps.slice(-need);
+    }
+    if (_session.taps.length < need) return;
     var summary = sessionSummary(_session);
     _lastSummary = summary;
+    _recordCalib(summary, 'auto');
     if (summary.accepted) {
+        _locking = false;
         persistIfAccepted(summary).then(function () {
             stopMeasure();
             _paintAll();
@@ -592,7 +757,7 @@ function _maybeGate() {
         return;
     }
     if (isFailCode(summary.code)) {
-        stopMeasure();
+        _locking = true;
     }
 }
 
@@ -602,6 +767,7 @@ function saveAnyway() {
         _paintAll();
         return Promise.resolve({ ok: false, reason: 'no-offset' });
     }
+    _recordCalib(summary, 'save_anyway');
     return persistTiming(buildTimingPayload(summary)).then(function (res) {
         _paintAll();
         return res;
@@ -613,6 +779,7 @@ function saveManual(view) {
     var raw = input ? input.value : '';
     var n = Number(raw);
     if (!Number.isFinite(n)) return Promise.resolve({ ok: false, reason: 'non-finite' });
+    _recordCalib({ accepted: true, offsetMs: n, n: 0 }, 'manual');
     return persistTiming(buildTimingPayload({ offsetMs: n, n: 0, accepted: true }, { offset_ms: n })).then(function (res) {
         _paintAll();
         return res;
@@ -791,6 +958,9 @@ function resetForTests() {
     _lastWrite = null;
     _listenersBound = false;
     _clickCtx = null;
+    _warmupLeft = 0;
+    _locking = false;
+    _clickBeat = 0;
 }
 
 var api = {
@@ -822,12 +992,18 @@ var api = {
     currentTag: currentTag,
     SUGGESTED_CHART_ID: SUGGESTED_CHART_ID,
     FAIL_COPY: FAIL_COPY,
+    failCopy: failCopy,
     EMPTY_COPY: EMPTY_COPY,
     OFFSET_MAX_MS: OFFSET_MAX_MS,
+    COUNT_IN_BEATS: COUNT_IN_BEATS,
+    WARMUP_DISCARD: WARMUP_DISCARD,
     resetForTests: resetForTests,
     _uiState: _uiState,
     _lastWrite: function () { return _lastWrite; },
     _views: function () { return _views; },
+    _getClickCtx: function () { return _clickCtx; },
+    _scheduleClicks: _scheduleClicks,
+    _clickStartedAt: function () { return _clickStartedAt; },
 };
 
 function publish() {

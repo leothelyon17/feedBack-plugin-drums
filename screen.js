@@ -42,6 +42,7 @@ if (typeof require === 'function' && typeof module !== 'undefined') {
 var _drumTimingMod = null;
 var _drumTimingLoadPromise = null;
 if (typeof require === 'function' && typeof module !== 'undefined') {
+    try { require('./assets/drum-timing-debug.js'); } catch (_) { /* browser bundle */ }
     try { _drumTimingMod = require('./assets/drum-timing.js'); } catch (_) { _drumTimingMod = null; }
 }
 
@@ -145,11 +146,22 @@ function _ensureDrumTiming(cb) {
     }
     if (!_drumTimingLoadPromise) {
         _drumTimingLoadPromise = new Promise(function (resolve) {
-            const s = document.createElement('script');
-            s.src = '/api/plugins/drums/assets/drum-timing.js?v=init-004-spec-002';
-            s.onload = function () { resolve(window.feedBackDrumsTiming || null); };
-            s.onerror = function () { resolve(null); };
-            (document.head || document.documentElement).appendChild(s);
+            function loadTiming() {
+                const s = document.createElement('script');
+                s.src = '/api/plugins/drums/assets/drum-timing.js?v=init-004-spec-002';
+                s.onload = function () { resolve(window.feedBackDrumsTiming || null); };
+                s.onerror = function () { resolve(null); };
+                (document.head || document.documentElement).appendChild(s);
+            }
+            if (typeof window !== 'undefined' && window.feedBackDrumDebug) {
+                loadTiming();
+                return;
+            }
+            const ds = document.createElement('script');
+            ds.src = '/api/plugins/drums/assets/drum-timing-debug.js?v=init-006-debug';
+            ds.onload = loadTiming;
+            ds.onerror = loadTiming;
+            (document.head || document.documentElement).appendChild(ds);
         });
     }
     _drumTimingLoadPromise.then(function (mod) {
@@ -3016,6 +3028,16 @@ function createFactory() {
 
         if (_cfg.hitDetection) {
             _checkHit(midiNote, ts);
+        } else {
+            try {
+                const dbg = (typeof window !== 'undefined' && window.feedBackDrumDebug) || null;
+                if (dbg && typeof dbg.recordJudge === 'function') {
+                    dbg.recordJudge({ kind: 'skip', reason: 'hit-detection-off' }, {
+                        offsetMs: _readDrumOffsetMs(),
+                        hitDetection: false,
+                    });
+                }
+            } catch (_) { /* debug optional */ }
         }
     }
 
@@ -3030,6 +3052,16 @@ function createFactory() {
             chords: _latestChords,
             hitKeys: _hitNoteKeys,
         });
+        try {
+            const dbg = (typeof window !== 'undefined' && window.feedBackDrumDebug) || null;
+            if (dbg && typeof dbg.recordJudge === 'function') {
+                dbg.recordJudge(result, {
+                    offsetMs: _readDrumOffsetMs(),
+                    hitDetection: true,
+                    playedLane: result && result.playedLane,
+                });
+            }
+        } catch (_) { /* debug optional */ }
         if (!result || result.kind === 'skip') return;
         const practice = _autoTrimPractice();
         if (result.kind === 'hit') {
