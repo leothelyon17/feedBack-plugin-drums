@@ -277,7 +277,8 @@ function _eventTimeStamp(e) {
     return (typeof ts === 'number' && Number.isFinite(ts)) ? ts : 0;
 }
 
-// INIT-004/SPEC-003: MIDI timeStamp → highway.getTime() → effective_t.
+// INIT-004/SPEC-003: MIDI timeStamp → highway judge clock → effective_t.
+// INIT-006/SPEC-003: prefer getJudgeTime() (judge plane); fall back to getTime().
 // Scoring, gem drawClock, and audio schedule share one signed device offset.
 // Missing getter ⇒ 0 and must not throw. Do not write the visual A/V trim.
 
@@ -292,8 +293,10 @@ function _nowMs() {
 function _highwayGetTime() {
     try {
         const hw = typeof window !== 'undefined' ? window.highway : null;
-        if (hw && typeof hw.getTime === 'function') {
-            const t = Number(hw.getTime());
+        if (!hw) return 0;
+        const fn = (typeof hw.getJudgeTime === 'function') ? hw.getJudgeTime : hw.getTime;
+        if (typeof fn === 'function') {
+            const t = Number(fn.call(hw));
             if (Number.isFinite(t)) return t;
         }
     } catch (_) { /* degrade to 0 */ }
@@ -389,6 +392,210 @@ function _clocksForApply(input) {
         audioClock: _audioScheduleWhen(Number.isFinite(tChart) ? tChart : 0, safeOff),
         offsetMs: safeOff,
     };
+}
+
+// INIT-006/SPEC-003: in-play signed-error HUD (display-only). Never writes
+// timing.offset_ms / writeTiming. Ritual Calibration stays in drum-timing.js.
+const IN_PLAY_ERROR_WINDOW = 16;
+const IN_PLAY_SIGN_DOC = 'Sign: − early, + late (t_hit − t_note on the judge plane)';
+
+function _signedErrorMs(tHit, tNote) {
+    const hit = Number(tHit);
+    const note = Number(tNote);
+    if (!Number.isFinite(hit) || !Number.isFinite(note)) return NaN;
+    return Math.round((hit - note) * 1000);
+}
+
+function _medianMs(values) {
+    const nums = [];
+    if (values) {
+        for (let i = 0; i < values.length; i++) {
+            const n = Number(values[i]);
+            if (Number.isFinite(n)) nums.push(n);
+        }
+    }
+    if (!nums.length) return null;
+    nums.sort((a, b) => a - b);
+    const mid = Math.floor(nums.length / 2);
+    if (nums.length % 2) return nums[mid];
+    return (nums[mid - 1] + nums[mid]) / 2;
+}
+
+function _fmtSignedMs(ms) {
+    if (!Number.isFinite(ms)) return '';
+    const r = Math.round(ms);
+    if (r === 0) return '0 ms';
+    return (r > 0 ? '+' : '') + r + ' ms';
+}
+
+function _errorDir(ms) {
+    if (!Number.isFinite(ms)) return null;
+    const r = Math.round(ms);
+    if (r < 0) return 'early';
+    if (r > 0) return 'late';
+    return 'on';
+}
+
+function _errorShape(dir) {
+    if (dir === 'early') return '▲';
+    if (dir === 'late') return '▼';
+    if (dir === 'on') return '●';
+    return '';
+}
+
+function _errorWord(dir) {
+    if (dir === 'early') return 'EARLY';
+    if (dir === 'late') return 'LATE';
+    if (dir === 'on') return 'ON TIME';
+    return '';
+}
+
+function _pushInPlaySample(samples, errorMs, tHit, windowN) {
+    const n = Number.isFinite(windowN) && windowN > 0 ? windowN : IN_PLAY_ERROR_WINDOW;
+    if (!Array.isArray(samples)) return [];
+    if (!Number.isFinite(errorMs) || !Number.isFinite(tHit)) return samples;
+    const last = samples.length ? samples[samples.length - 1] : null;
+    if (last && Number.isFinite(last.tHit) && tHit < last.tHit) return samples;
+    samples.push({ errorMs: errorMs, tHit: tHit });
+    while (samples.length > n) samples.shift();
+    return samples;
+}
+
+function _recordInPlayFromJudge(samples, result, windowN) {
+    if (!result || result.kind !== 'hit') return samples;
+    const err = Number.isFinite(result.errorMs)
+        ? result.errorMs
+        : _signedErrorMs(result.t, result.noteT);
+    return _pushInPlaySample(samples, err, result.t, windowN);
+}
+
+function _inPlayHudModel(errorMsList) {
+    const windowN = IN_PLAY_ERROR_WINDOW;
+    const errors = [];
+    if (errorMsList) {
+        for (let i = 0; i < errorMsList.length; i++) {
+            const n = Number(errorMsList[i]);
+            if (Number.isFinite(n)) errors.push(n);
+        }
+    }
+    const count = errors.length;
+    const latest = count ? errors[count - 1] : null;
+    const dir = _errorDir(latest);
+    const median = _medianMs(errors);
+    const medianDir = _errorDir(median);
+    const latestLabel = count === 0
+        ? 'No hits yet'
+        : (_errorWord(dir) + ' ' + _fmtSignedMs(latest)).trim();
+    const medianLabel = count === 0
+        ? 'Median last ' + windowN + ': no hits yet'
+        : 'Median last ' + windowN + ': ' + _fmtSignedMs(median)
+            + (medianDir && medianDir !== 'on' ? ' (' + medianDir + ')' : '');
+    const ariaText = count === 0
+        ? 'No hits yet. ' + IN_PLAY_SIGN_DOC
+        : latestLabel + '. ' + IN_PLAY_SIGN_DOC;
+    return {
+        signDoc: IN_PLAY_SIGN_DOC,
+        empty: count === 0,
+        windowN: windowN,
+        count: count,
+        latestMs: latest,
+        latestDir: dir,
+        latestShape: _errorShape(dir),
+        latestLabel: latestLabel,
+        medianMs: median,
+        medianDir: medianDir,
+        medianLabel: medianLabel,
+        ariaText: ariaText,
+    };
+}
+
+function _hudChild(host, key) {
+    if (!host) return null;
+    const ds = host.dataset && host.dataset.drumsInplay;
+    const attr = typeof host.getAttribute === 'function' ? host.getAttribute('data-drums-inplay') : null;
+    if (ds === key || attr === key) return host;
+    const kids = host.children || [];
+    for (let i = 0; i < kids.length; i++) {
+        const found = _hudChild(kids[i], key);
+        if (found) return found;
+    }
+    return null;
+}
+
+function _fillInPlayHudDom(host, doc) {
+    if (!host) return host;
+    const d = doc || (typeof document !== 'undefined' ? document : null);
+    if (!d || typeof d.createElement !== 'function') return host;
+    host.className = 'drums-inplay-hud';
+    host.setAttribute('data-drums-inplay', 'hud');
+    if (host.dataset) host.dataset.drumsInplay = 'hud';
+
+    const sign = d.createElement('p');
+    sign.className = 'drums-inplay-sign';
+    sign.setAttribute('data-drums-inplay', 'sign');
+    if (sign.dataset) sign.dataset.drumsInplay = 'sign';
+    sign.textContent = IN_PLAY_SIGN_DOC;
+
+    const latest = d.createElement('p');
+    latest.className = 'drums-inplay-latest';
+    latest.setAttribute('data-drums-inplay', 'live');
+    if (latest.dataset) latest.dataset.drumsInplay = 'live';
+    latest.setAttribute('role', 'status');
+    latest.setAttribute('aria-live', 'polite');
+    latest.setAttribute('aria-atomic', 'true');
+
+    const icon = d.createElement('span');
+    icon.className = 'drums-inplay-icon';
+    icon.setAttribute('data-drums-inplay', 'icon');
+    if (icon.dataset) icon.dataset.drumsInplay = 'icon';
+    icon.setAttribute('aria-hidden', 'true');
+
+    const label = d.createElement('span');
+    label.setAttribute('data-drums-inplay', 'latest-text');
+    if (label.dataset) label.dataset.drumsInplay = 'latest-text';
+
+    latest.appendChild(icon);
+    latest.appendChild(label);
+
+    const median = d.createElement('p');
+    median.className = 'drums-inplay-median';
+    median.setAttribute('data-drums-inplay', 'median');
+    if (median.dataset) median.dataset.drumsInplay = 'median';
+
+    host.appendChild(sign);
+    host.appendChild(latest);
+    host.appendChild(median);
+    return host;
+}
+
+function _paintInPlayHud(host, model) {
+    if (!host || !model) return model;
+    const sign = _hudChild(host, 'sign');
+    if (sign) sign.textContent = model.signDoc;
+    const icon = _hudChild(host, 'icon');
+    if (icon) {
+        icon.textContent = model.latestShape || '';
+        if (model.latestDir) icon.setAttribute('data-dir', model.latestDir);
+        else if (typeof icon.removeAttribute === 'function') icon.removeAttribute('data-dir');
+    }
+    const text = _hudChild(host, 'latest-text');
+    if (text) text.textContent = model.latestLabel;
+    const live = _hudChild(host, 'live');
+    if (live) {
+        live.setAttribute('aria-live', 'polite');
+        live.setAttribute('aria-label', model.ariaText);
+    }
+    const med = _hudChild(host, 'median');
+    if (med) med.textContent = model.medianLabel;
+    if (model.latestDir) host.setAttribute('data-dir', model.latestDir);
+    else if (typeof host.removeAttribute === 'function') host.removeAttribute('data-dir');
+    return model;
+}
+
+function _syncAllInPlayHuds() {
+    for (const inst of _instances) {
+        if (inst && typeof inst._syncInPlayHud === 'function') inst._syncInPlayHud();
+    }
 }
 
 // Fallback piece-id → lane-id, mirroring core PRESETS. Vocabulary presets
@@ -843,7 +1050,10 @@ function _setSharedSetting(partial) {
         if (_synthGain) _synthGain.gain.value = partial.synthVolume;
     }
     if (partial.midiChannel !== undefined) _cfg.midiChannel = partial.midiChannel;
-    if (partial.hitDetection !== undefined) _cfg.hitDetection = partial.hitDetection;
+    if (partial.hitDetection !== undefined) {
+        _cfg.hitDetection = partial.hitDetection;
+        _syncAllInPlayHuds();
+    }
     if (_applyingSharedSettings) return;
     const di = _drumInput();
     if (di && typeof di.update === 'function') {
@@ -883,6 +1093,7 @@ function _applySharedSettings(state) {
                     el.checked = state.hitDetection;
                 });
             }
+            _syncAllInPlayHuds();
         }
         if (typeof state.deviceEnabled === 'boolean') {
             if (!state.deviceEnabled) {
@@ -1197,7 +1408,7 @@ function _judgeDrumHit(playedMidi, timeStamp, snapshot) {
             const key = _noteKey(n.t, songMidi);
             if (songLane === playedLane && Math.abs(n.t - t) <= HIT_TOLERANCE && !hitKeys.has(key)) {
                 hitKeys.add(key);
-                return { kind: 'hit', t, key, playedLane };
+                return { kind: 'hit', t, noteT: n.t, errorMs: _signedErrorMs(t, n.t), key, playedLane };
             }
         }
     }
@@ -1212,7 +1423,7 @@ function _judgeDrumHit(playedMidi, timeStamp, snapshot) {
                 const key = _noteKey(c.t, songMidi);
                 if (songLane === playedLane && Math.abs(c.t - t) <= HIT_TOLERANCE && !hitKeys.has(key)) {
                     hitKeys.add(key);
-                    return { kind: 'hit', t, key, playedLane };
+                    return { kind: 'hit', t, noteT: c.t, errorMs: _signedErrorMs(t, c.t), key, playedLane };
                 }
             }
         }
@@ -2470,6 +2681,10 @@ function createFactory() {
     // Settings UI — gear opens the shared editor (INIT-003/SPEC-005).
     let _settingsGear = null;
 
+    // INIT-006/SPEC-003: in-play early/late HUD (DOM overlay, display-only).
+    let _inPlayHud = null;
+    const _inPlaySamples = [];
+
     // Held / flash state — per-instance so each panel only shows the
     // pads ITS focused user is hitting.
     const _heldPads = new Map();          // midi note -> {velocity, wall}
@@ -2625,6 +2840,7 @@ function createFactory() {
 
     function _checkHit(playedMidi, timeStamp) {
         // INIT-004/SPEC-003: judge on MIDI timeStamp → getTime() → effective_t.
+        // INIT-006/SPEC-003: prefer highway.getJudgeTime() via _highwayGetTime.
         // Do not read _latestTime / visual clock as the judge.
         const result = _judgeDrumHit(playedMidi, timeStamp, {
             notes: _latestNotes,
@@ -2636,6 +2852,8 @@ function createFactory() {
             _hits++;
             _streak++;
             if (_streak > _bestStreak) _bestStreak = _streak;
+            _recordInPlayFromJudge(_inPlaySamples, result, IN_PLAY_ERROR_WINDOW);
+            _syncInPlayHud();
         } else {
             _misses++;
             _streak = 0;
@@ -2693,6 +2911,8 @@ function createFactory() {
         _missedNoteKeys.clear();
         _wrongFlashes.length = 0;
         _laneFlashes.length = 0;
+        _inPlaySamples.length = 0;
+        _syncInPlayHud();
     }
 
     function _resetForNewChart() {
@@ -2710,6 +2930,50 @@ function createFactory() {
     }
 
     // ── Settings panel + gear button (per-instance) ──
+
+    function _injectInPlayHud() {
+        if (_inPlayHud) return;
+        if (typeof document === 'undefined' || !document.createElement) return;
+        if (!_highwayCanvas || !_highwayCanvas.parentNode) return;
+        const parent = _highwayCanvas.parentNode;
+        if (parent && parent !== document && parent.style) {
+            const pos = parent.style.position;
+            if (!pos || pos === 'static') {
+                parent.style.position = 'relative';
+                if (parent.dataset) parent.dataset.drumsInplayPos = '1';
+            }
+        }
+        const host = document.createElement('div');
+        _fillInPlayHudDom(host, document);
+        host.setAttribute('data-drums-instance', String(_instanceId));
+        parent.appendChild(host);
+        _inPlayHud = host;
+        _syncInPlayHud();
+    }
+
+    function _removeInPlayHud() {
+        const parent = _inPlayHud && _inPlayHud.parentNode;
+        if (_inPlayHud && parent) {
+            try { parent.removeChild(_inPlayHud); } catch (_) { /* ignore */ }
+        }
+        if (parent && parent.dataset && parent.dataset.drumsInplayPos === '1') {
+            if (parent.style) parent.style.position = '';
+            delete parent.dataset.drumsInplayPos;
+        }
+        _inPlayHud = null;
+    }
+
+    function _syncInPlayHud() {
+        if (!_inPlayHud) {
+            if (_cfg.hitDetection) _injectInPlayHud();
+            if (!_inPlayHud) return;
+        }
+        _inPlayHud.hidden = !_cfg.hitDetection;
+        if (!_cfg.hitDetection) return;
+        const errors = [];
+        for (let i = 0; i < _inPlaySamples.length; i++) errors.push(_inPlaySamples[i].errorMs);
+        _paintInPlayHud(_inPlayHud, _inPlayHudModel(errors));
+    }
 
     function _injectSettingsGear() {
         if (_settingsGear) return;
@@ -3224,6 +3488,7 @@ function createFactory() {
 
         _removeSettingsPanel();
         _removeSettingsGear();
+        _removeInPlayHud();
 
         _releaseAllSounding();
 
@@ -3292,6 +3557,7 @@ function createFactory() {
             }
 
             _injectSettingsGear();
+            _injectInPlayHud();
             _applyCanvasDims();
             window.addEventListener('resize', _onWinResize);
 
@@ -3453,6 +3719,7 @@ function createFactory() {
         _handleDrumHit,
         _releaseAllSounding,
         _resetScoring,
+        _syncInPlayHud,
     };
 
     return instance;
@@ -3497,6 +3764,11 @@ if (typeof module !== 'undefined' && module.exports) {
         HIT_TOLERANCE, _readDrumOffsetMs, _highwayGetTime, _judgeTimeFromMidi,
         _applyDrumOffsetSec, _audioScheduleWhen, _convertMidiFallback,
         _clocksForApply, _judgeDrumHit,
+        // INIT-006/SPEC-003
+        IN_PLAY_ERROR_WINDOW, IN_PLAY_SIGN_DOC, _signedErrorMs, _medianMs,
+        _fmtSignedMs, _errorDir, _errorShape, _pushInPlaySample,
+        _recordInPlayFromJudge, _inPlayHudModel, _fillInPlayHudDom, _paintInPlayHud,
+        _hudChild,
         // INIT-002/SPEC-003
         _mappingMutationsEnabled, _buildMappingRows, _buildNoteChipsHtml,
         _pieceDisplayName, _gmMidiNotesForPiece, _customMidiNotesForPiece,
