@@ -45,6 +45,14 @@ if (typeof require === 'function' && typeof module !== 'undefined') {
     try { _drumTimingMod = require('./assets/drum-timing.js'); } catch (_) { _drumTimingMod = null; }
 }
 
+// INIT-006/SPEC-007: opt-in damped auto-trim (default off). Persist lives here,
+// not in the in-play HUD helpers — those stay display-only when trim is off.
+var _drumAutoTrimMod = null;
+var _drumAutoTrimLoadPromise = null;
+if (typeof require === 'function' && typeof module !== 'undefined') {
+    try { _drumAutoTrimMod = require('./assets/drum-auto-trim.js'); } catch (_) { _drumAutoTrimMod = null; }
+}
+
 function _getDrumEditor() {
     if (_drumsEditorMod) return _drumsEditorMod;
     if (typeof window !== 'undefined' && window.feedBackDrumsEditor) {
@@ -85,6 +93,43 @@ function _getDrumTiming() {
         _drumTimingMod = window.feedBackDrumsTiming;
         return _drumTimingMod;
     }
+    return null;
+}
+
+function _getDrumAutoTrim() {
+    if (_drumAutoTrimMod) return _drumAutoTrimMod;
+    if (typeof window !== 'undefined' && window.feedBackDrumsAutoTrim) {
+        _drumAutoTrimMod = window.feedBackDrumsAutoTrim;
+        return _drumAutoTrimMod;
+    }
+    const fb = typeof window !== 'undefined' ? (window.feedBack || window.feedback || window.slopsmith) : null;
+    if (fb && fb.drumAutoTrim) return fb.drumAutoTrim;
+    return null;
+}
+
+function _ensureDrumAutoTrim(cb) {
+    const existing = _getDrumAutoTrim();
+    if (existing) {
+        if (typeof cb === 'function') cb(existing);
+        return existing;
+    }
+    if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
+        if (typeof cb === 'function') cb(null);
+        return null;
+    }
+    if (!_drumAutoTrimLoadPromise) {
+        _drumAutoTrimLoadPromise = new Promise(function (resolve) {
+            const s = document.createElement('script');
+            s.src = '/api/plugins/drums/assets/drum-auto-trim.js?v=init-006-spec-007';
+            s.onload = function () { resolve(window.feedBackDrumsAutoTrim || null); };
+            s.onerror = function () { resolve(null); };
+            (document.head || document.documentElement).appendChild(s);
+        });
+    }
+    _drumAutoTrimLoadPromise.then(function (mod) {
+        if (mod) _drumAutoTrimMod = mod;
+        if (typeof cb === 'function') cb(mod);
+    });
     return null;
 }
 
@@ -178,6 +223,9 @@ const STORE_KEYS = {
     // Cr/Ri/Ki layout. 'rb4' is a denser 7-lane Rock-Band-style preset.
     // Persisted via _saveCfg below.
     lanePreset:     'drums_lane_preset_v1',
+    // INIT-006/SPEC-007: opt-in auto-trim. Plugin-local only — not a core
+    // /api/settings drum field. Default off (missing store key → false).
+    autoTrim:       'drums_auto_trim',
 };
 
 // Valid preset ids — kept here so _saveCfg can validate before persisting
@@ -598,6 +646,131 @@ function _syncAllInPlayHuds() {
     }
 }
 
+// INIT-006/SPEC-007: auto-trim wiring lives outside the HUD helper block
+// so SPEC-003's display-only source scan stays valid when trim is off.
+function _autoTrimPractice() {
+    const trim = _getDrumAutoTrim();
+    return !!(trim && typeof trim.isEnabled === 'function' && trim.isEnabled());
+}
+
+function _autoTrimRunInvalid() {
+    const trim = _getDrumAutoTrim();
+    return !!(trim && typeof trim.isRunInvalidated === 'function' && trim.isRunInvalidated());
+}
+
+function _autoTrimRecordHit(result) {
+    const trim = _getDrumAutoTrim();
+    if (!trim || typeof trim.recordHit !== 'function') return;
+    const err = result && Number.isFinite(result.errorMs) ? result.errorMs : NaN;
+    try { trim.recordHit(err); } catch (_) { /* degrade-noop */ }
+}
+
+function _autoTrimOnNewRun() {
+    const trim = _getDrumAutoTrim();
+    if (trim && typeof trim.onNewRun === 'function') {
+        try { trim.onNewRun(); } catch (_) { /* ignore */ }
+    }
+}
+
+function _setAutoTrimEnabled(on) {
+    const next = !!on;
+    _saveCfg('autoTrim', next);
+    const trim = _getDrumAutoTrim();
+    if (trim && typeof trim.setEnabled === 'function') {
+        try { trim.setEnabled(next); } catch (_) { /* ignore */ }
+    }
+    _syncAllInPlayHuds();
+}
+
+function _bootAutoTrimPref() {
+    const trim = _getDrumAutoTrim();
+    if (trim && typeof trim.setEnabled === 'function') {
+        try { trim.setEnabled(!!_cfg.autoTrim); } catch (_) { /* ignore */ }
+    }
+}
+
+function _appendAutoTrimControls(host, doc) {
+    if (!host) return host;
+    const d = doc || (typeof document !== 'undefined' ? document : null);
+    if (!d || typeof d.createElement !== 'function') return host;
+    if (_hudChild(host, 'autotrim')) return host;
+
+    const row = d.createElement('div');
+    row.className = 'drums-autotrim';
+    row.setAttribute('data-drums-inplay', 'autotrim');
+    if (row.dataset) row.dataset.drumsInplay = 'autotrim';
+
+    const label = d.createElement('label');
+    label.className = 'drums-autotrim-label';
+    label.setAttribute('data-drums-inplay', 'autotrim-label');
+
+    const box = d.createElement('input');
+    box.type = 'checkbox';
+    box.className = 'drums-autotrim-check';
+    box.setAttribute('data-drums-inplay', 'autotrim-check');
+    box.setAttribute('aria-label', 'Enable auto-trim (practice, not ranked)');
+    box.checked = !!_cfg.autoTrim;
+    const onChange = function () {
+        _setAutoTrimEnabled(!!box.checked);
+    };
+    if (typeof box.addEventListener === 'function') box.addEventListener('change', onChange);
+    else box.onchange = onChange;
+
+    const caption = d.createElement('span');
+    caption.textContent = 'Auto-trim offset (practice)';
+    label.appendChild(box);
+    label.appendChild(caption);
+
+    const status = d.createElement('p');
+    status.className = 'drums-autotrim-status';
+    status.setAttribute('data-drums-inplay', 'autotrim-status');
+    status.setAttribute('role', 'status');
+    status.setAttribute('aria-live', 'polite');
+
+    const practice = d.createElement('p');
+    practice.className = 'drums-autotrim-practice';
+    practice.setAttribute('data-drums-inplay', 'autotrim-practice');
+    practice.textContent = 'Practice — this run is not ranked';
+
+    row.appendChild(label);
+    row.appendChild(status);
+    row.appendChild(practice);
+    host.appendChild(row);
+    return host;
+}
+
+function _paintAutoTrim(host) {
+    if (!host) return;
+    const trim = _getDrumAutoTrim();
+    const model = trim && typeof trim.uiModel === 'function' ? trim.uiModel() : {
+        enabled: !!_cfg.autoTrim,
+        stable: false,
+        runInvalidated: false,
+        scoring: !_cfg.autoTrim,
+        count: 0,
+        sampleSize: 20,
+        statusLabel: _cfg.autoTrim ? 'Collecting 0/20' : 'Auto-trim off',
+    };
+    const box = _hudChild(host, 'autotrim-check');
+    if (box) box.checked = !!model.enabled;
+    const status = _hudChild(host, 'autotrim-status');
+    if (status) status.textContent = model.statusLabel || '';
+    const practice = _hudChild(host, 'autotrim-practice');
+    if (practice) {
+        practice.hidden = !model.runInvalidated;
+        if (practice.hidden && typeof practice.setAttribute === 'function') {
+            practice.setAttribute('hidden', 'true');
+        } else if (!practice.hidden && typeof practice.removeAttribute === 'function') {
+            practice.removeAttribute('hidden');
+        }
+    }
+    const row = _hudChild(host, 'autotrim');
+    if (row) {
+        row.setAttribute('data-state', model.stable ? 'stable' : (model.enabled ? 'on' : 'off'));
+    }
+    return model;
+}
+
 // Fallback piece-id → lane-id, mirroring core PRESETS. Vocabulary presets
 // overlay this when GET /api/drums/vocabulary succeeds. ekit_full is out
 // of scope as a lane preset (lane-id model cannot express one-lane-per-piece).
@@ -932,6 +1105,7 @@ const _cfg = {
         const raw = _readStore(STORE_KEYS.lanePreset);
         return _VALID_LANE_PRESETS.has(raw) ? raw : 'phase_shift_8';
     })(),
+    autoTrim:       _readStore(STORE_KEYS.autoTrim) === 'true',
     // Transient: which lane is in learn mode. Module-scope across
     // panels — the Learn-mode UX is "click Learn in any panel, then
     // hit a pad on the focused MIDI device." The next focused-panel
@@ -2554,8 +2728,17 @@ function _bootDrumTiming() {
     });
 }
 
+function _bootDrumAutoTrim() {
+    _ensureDrumAutoTrim(function () {
+        _bootAutoTrimPref();
+    });
+    _bootAutoTrimPref();
+}
+
 if (typeof document !== 'undefined') _bootSettingsEditor();
 if (typeof document !== 'undefined') _bootDrumTiming();
+if (typeof document !== 'undefined') _bootDrumAutoTrim();
+if (typeof module !== 'undefined') _bootAutoTrimPref();
 
 // ═══════════════════════════════════════════════════════════════════════
 // Splitscreen helper wrappers
@@ -2848,15 +3031,21 @@ function createFactory() {
             hitKeys: _hitNoteKeys,
         });
         if (!result || result.kind === 'skip') return;
+        const practice = _autoTrimPractice();
         if (result.kind === 'hit') {
-            _hits++;
-            _streak++;
-            if (_streak > _bestStreak) _bestStreak = _streak;
+            if (!practice) {
+                _hits++;
+                _streak++;
+                if (_streak > _bestStreak) _bestStreak = _streak;
+            }
             _recordInPlayFromJudge(_inPlaySamples, result, IN_PLAY_ERROR_WINDOW);
+            _autoTrimRecordHit(result);
             _syncInPlayHud();
         } else {
-            _misses++;
-            _streak = 0;
+            if (!practice) {
+                _misses++;
+                _streak = 0;
+            }
             _wrongFlashes.push({ lane: result.playedLane, wall: performance.now() });
         }
     }
@@ -2912,6 +3101,7 @@ function createFactory() {
         _wrongFlashes.length = 0;
         _laneFlashes.length = 0;
         _inPlaySamples.length = 0;
+        _autoTrimOnNewRun();
         _syncInPlayHud();
     }
 
@@ -2945,6 +3135,7 @@ function createFactory() {
         }
         const host = document.createElement('div');
         _fillInPlayHudDom(host, document);
+        _appendAutoTrimControls(host, document);
         host.setAttribute('data-drums-instance', String(_instanceId));
         parent.appendChild(host);
         _inPlayHud = host;
@@ -2973,6 +3164,8 @@ function createFactory() {
         const errors = [];
         for (let i = 0; i < _inPlaySamples.length; i++) errors.push(_inPlaySamples[i].errorMs);
         _paintInPlayHud(_inPlayHud, _inPlayHudModel(errors));
+        _appendAutoTrimControls(_inPlayHud, document);
+        _paintAutoTrim(_inPlayHud);
     }
 
     function _injectSettingsGear() {
@@ -3175,7 +3368,7 @@ function createFactory() {
             _drawLaneLabels(ctx, laneLayout, nowLineY, H);
         }
 
-        if (_cfg.hitDetection && (_hits + _misses) > 0) {
+        if (_cfg.hitDetection && ((_hits + _misses) > 0 || _autoTrimRunInvalid())) {
             _drawAccuracyHUD(ctx, W, H);
         }
 
@@ -3446,10 +3639,16 @@ function createFactory() {
 
     function _drawAccuracyHUD(ctx, W /* , H */) {
         const total = _hits + _misses;
-        if (total === 0) return;
+        const practice = _autoTrimRunInvalid();
+        if (total === 0 && !practice) return;
 
-        const pct = Math.round((_hits / total) * 100);
-        const text = `Accuracy: ${pct}%   Streak: ${_streak}   Best: ${_bestStreak}   ${_hits}/${total}`;
+        const pct = total > 0 ? Math.round((_hits / total) * 100) : 0;
+        const ranked = practice
+            ? (total > 0
+                ? `Practice · not ranked   ${pct}%   ${_hits}/${total}`
+                : 'Practice · this run is not ranked')
+            : `Accuracy: ${pct}%   Streak: ${_streak}   Best: ${_bestStreak}   ${_hits}/${total}`;
+        const text = ranked;
 
         ctx.font = 'bold 12px sans-serif';
         const tw = ctx.measureText(text).width;
@@ -3462,7 +3661,9 @@ function createFactory() {
         _roundRect(ctx, hudX, hudY, hudW, hudH, 6);
         ctx.fill();
 
-        ctx.fillStyle = pct >= 80 ? '#22cc66' : pct >= 50 ? '#ffcc33' : '#ff6644';
+        ctx.fillStyle = practice
+            ? '#93c5fd'
+            : (pct >= 80 ? '#22cc66' : pct >= 50 ? '#ffcc33' : '#ff6644');
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         ctx.fillText(text, W / 2, hudY + hudH / 2);
@@ -3769,6 +3970,9 @@ if (typeof module !== 'undefined' && module.exports) {
         _fmtSignedMs, _errorDir, _errorShape, _pushInPlaySample,
         _recordInPlayFromJudge, _inPlayHudModel, _fillInPlayHudDom, _paintInPlayHud,
         _hudChild,
+        // INIT-006/SPEC-007
+        _getDrumAutoTrim, _autoTrimPractice, _autoTrimRunInvalid, _autoTrimRecordHit,
+        _setAutoTrimEnabled, _appendAutoTrimControls, _paintAutoTrim,
         // INIT-002/SPEC-003
         _mappingMutationsEnabled, _buildMappingRows, _buildNoteChipsHtml,
         _pieceDisplayName, _gmMidiNotesForPiece, _customMidiNotesForPiece,
