@@ -22,6 +22,7 @@ function el(tag) {
         parentNode: null,
         hidden: false,
         disabled: false,
+        checked: false,
         value: '',
         tabIndex: 0,
         _listeners: {},
@@ -89,6 +90,7 @@ function queryAll(root, sel) {
         return false;
     }
     function walk(n) {
+        if (!n || typeof n.getAttribute !== 'function') return;
         if (match(n)) out.push(n);
         (n.children || []).forEach(walk);
     }
@@ -103,6 +105,9 @@ function makeDocument() {
         body,
         documentElement: body,
         createElement(tag) { return el(tag); },
+        createTextNode(text) {
+            return { nodeType: 3, textContent: String(text), parentNode: null };
+        },
         addEventListener() {},
         removeEventListener() {},
         dispatchEvent() { return true; },
@@ -226,6 +231,13 @@ function fresh(opts) {
 
 afterEach(() => {
     try {
+        const debugFile = path.join(__dirname, '..', 'assets', 'drum-timing-debug.js');
+        const debugCached = require.cache[require.resolve(debugFile)];
+        if (debugCached && debugCached.exports && typeof debugCached.exports.resetForTests === 'function') {
+            debugCached.exports.resetForTests();
+        }
+    } catch (_) { /* ignore */ }
+    try {
         const file = TIMING_JS;
         const cached = require.cache[require.resolve(file)];
         if (cached && cached.exports && typeof cached.exports.resetForTests === 'function') {
@@ -250,6 +262,8 @@ test('ac-1: mount fills #midi-calibration-panel; run overlay uses the same rende
     assert.equal(hook(host, 'root').getAttribute('data-dt'), 'root');
     assert.equal(hook(host, 'title').textContent, 'Measure pad timing');
     assert.equal(hook(host, 'start').textContent, 'Start');
+    assert.ok(hook(host, 'debug-capture'));
+    assert.equal(hook(host, 'debug-capture').tagName, 'INPUT');
 
     const overlay = mod.run({ requester: 'onboarding', mode: 'overlay' });
     assert.equal(overlay.ok, true);
@@ -347,7 +361,7 @@ test('ac-4: auto-save only when accepted; fail_* is rejected; last-good survives
     assert.equal(mod.getOffsetMs(), 12);
 });
 
-test('ac-4/ac-5: a failed gate paints Hits were too scattered and Retry; Save anyway is secondary', async () => {
+test('ac-4/ac-5: a failed gate paints distinct fail copy and Retry; Save anyway is secondary', async () => {
     const mod = fresh({
         tap: mockTap(() => ({ ok: false, code: 'fail_verify', offsetMs: 14, n: 24, mad: 3 })),
         timingA: { offset_ms: 18, origin: 'localhost', audio_backend: 'html5' },
@@ -357,7 +371,10 @@ test('ac-4/ac-5: a failed gate paints Hits were too scattered and Retry; Save an
     mod.startMeasure();
     for (let i = 0; i < 24; i += 1) mod.handleNoteOn(38, 10);
     await new Promise((r) => setImmediate(r));
-    assert.equal(hook(host, 'gate-msg').textContent, 'Hits were too scattered');
+    assert.equal(hook(host, 'gate').hidden, true);
+    assert.match(hook(host, 'progress').textContent, /locking in/);
+    mod.stopMeasure();
+    assert.equal(hook(host, 'gate-msg').textContent, 'Last hits did not hold the measured offset');
     assert.equal(hook(host, 'gate').hidden, false);
     assert.equal(hook(host, 'retry').textContent, 'Retry');
     assert.equal(hook(host, 'retry').hidden, false);
@@ -369,6 +386,20 @@ test('ac-4/ac-5: a failed gate paints Hits were too scattered and Retry; Save an
     await mod.saveAnyway();
     assert.equal(mod._writes.length, 1);
     assert.equal(mod._writes[0].offset_ms, 14);
+});
+
+test('fail_mad gate paints Hits were too scattered', async () => {
+    const mod = fresh({
+        tap: mockTap(() => ({ ok: false, code: 'fail_mad', offsetMs: 14, n: 24, mad: 40 })),
+    });
+    const host = panel(mod);
+    mod.mount(host);
+    mod.startMeasure();
+    for (let i = 0; i < 24; i += 1) mod.handleNoteOn(38, 10);
+    await new Promise((r) => setImmediate(r));
+    mod.stopMeasure();
+    assert.equal(hook(host, 'gate-msg').textContent, 'Hits were too scattered');
+    assert.equal(mod.failCopy('fail_mad'), 'Hits were too scattered');
 });
 
 test('ac-5: empty state is Not set, never +0 ms', () => {
@@ -547,6 +578,100 @@ test('juce backend is tagged on save', async () => {
     assert.equal(mod._writes[0].audio_backend, 'juce');
 });
 
+test('failed window keeps recording and a later window auto-saves', async () => {
+    let reduces = 0;
+    const mod = fresh({
+        tap: mockTap(() => {
+            reduces += 1;
+            if (reduces < 2) return { ok: false, code: 'fail_verify', offsetMs: 14, n: 24 };
+            return { ok: true, offsetMs: 80, n: 24, mad: 2, heldOutMedianAbs: 3 };
+        }),
+    });
+    const host = panel(mod);
+    mod.mount(host);
+    mod.startMeasure();
+    for (let i = 0; i < 24; i += 1) mod.handleNoteOn(38, 10);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(mod._writes.length, 0);
+    assert.equal(mod._uiState().measuring, true);
+    assert.equal(mod._uiState().locking, true);
+    mod.handleNoteOn(38, 10);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(mod._writes.length, 1);
+    assert.equal(mod._writes[0].offset_ms, 80);
+    assert.equal(mod._uiState().measuring, false);
+});
+
+test('clicks are scheduled on the AudioContext grid, not setInterval', () => {
+    function FakeAC() {
+        this.currentTime = 10;
+        this.state = 'running';
+        this.starts = [];
+        this.destination = {};
+        const self = this;
+        this.createOscillator = function () {
+            return {
+                frequency: { value: 0 },
+                connect() {},
+                start(when) { self.starts.push(when); },
+                stop() {},
+            };
+        };
+        this.createGain = function () {
+            return { gain: { value: 0 }, connect() {} };
+        };
+    }
+    const mod = fresh();
+    window.AudioContext = FakeAC;
+    const host = panel(mod);
+    mod.mount(host);
+    mod.startMeasure();
+    const ctx = mod._getClickCtx();
+    const origin = mod._clickStartedAt();
+    assert.equal(origin, 10);
+    assert.deepEqual(ctx.starts, [10]);
+    ctx.currentTime = 10.3;
+    mod._scheduleClicks();
+    ctx.currentTime = 10.8;
+    mod._scheduleClicks();
+    assert.deepEqual(ctx.starts, [10, 10.5, 11]);
+    for (let i = 1; i < ctx.starts.length; i += 1) {
+        assert.ok(Math.abs((ctx.starts[i] - ctx.starts[i - 1]) - 0.5) < 1e-9);
+    }
+    mod.stopMeasure();
+});
+
+test('count-in and warmup hits are not stored in the 24', () => {
+    function FakeAC() {
+        this.currentTime = 0;
+        this.state = 'running';
+    }
+    const mod = fresh();
+    window.AudioContext = FakeAC;
+    const host = panel(mod);
+    mod.mount(host);
+    mod.startMeasure();
+    assert.equal(mod.COUNT_IN_BEATS, 4);
+    assert.equal(mod.WARMUP_DISCARD, 3);
+    assert.equal(mod.handleNoteOn(38, 10).reason, 'count-in');
+    assert.equal(mod._uiState().tapCount, 0);
+    assert.match(hook(host, 'progress').textContent, /Listen/);
+
+    const ctx = mod._getClickCtx();
+    assert.ok(ctx);
+    ctx.currentTime = 2.1;
+    assert.equal(mod.handleNoteOn(38, 10).reason, 'warmup');
+    assert.equal(mod.handleNoteOn(38, 10).reason, 'warmup');
+    assert.equal(mod.handleNoteOn(38, 10).remaining, 0);
+    assert.match(hook(host, 'progress').textContent, /Lock in|0 \/ 24/);
+
+    const counted = mod.handleNoteOn(38, 10);
+    assert.equal(counted.ok, true);
+    assert.equal(counted.n, 1);
+    assert.equal(mod._uiState().tapCount, 1);
+    assert.match(hook(host, 'progress').textContent, /1 \/ 24/);
+});
+
 test('source: no innerHTML of interpolated names; no av_offset leak in screen boot', () => {
     assert.doesNotMatch(TIMING_SRC, /innerHTML\s*\+/);
     assert.doesNotMatch(TIMING_SRC, /innerHTML\s*=/);
@@ -554,4 +679,6 @@ test('source: no innerHTML of interpolated names; no av_offset leak in screen bo
     assert.doesNotMatch(SCREEN_SRC, /av_offset_ms/);
     assert.match(SCREEN_SRC, /midi-calibration-panel/);
     assert.match(SCREEN_SRC, /drum-timing\.js/);
+    assert.match(SCREEN_SRC, /feedBackDrumDebug/);
+    assert.match(SCREEN_SRC, /recordJudge/);
 });

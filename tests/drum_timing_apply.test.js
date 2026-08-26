@@ -311,6 +311,12 @@ test('audio schedule helper applies the same signed ms; non-finite ctx → 0', (
     assert.equal(mod._applyDrumOffsetSec(Number.NaN, 40), Number.NaN);
 });
 
+test('in-play debug wiring references feedBackDrumDebug.recordJudge', () => {
+    assert.match(SCREEN_SRC, /feedBackDrumDebug/);
+    assert.match(SCREEN_SRC, /recordJudge/);
+    assert.match(SCREEN_SRC, /drum-timing-debug\.js/);
+});
+
 test('hit-path branches: highway clock, offset coerce, throws, unmapped, window skip', () => {
     const mod = freshPlugin();
     global.window.highway = { getTime() { return 2.5; } };

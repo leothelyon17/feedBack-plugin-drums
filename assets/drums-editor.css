@@ -376,6 +376,31 @@
     margin-left: 6px;
 }
 
+.drums-timing-debug-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.drums-timing-debug {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    font-size: 12px;
+    color: #9ca3af;
+    margin: 0;
+    cursor: pointer;
+}
+
+.drums-timing-debug input[type="checkbox"] {
+    margin: 0;
+}
+
+.drums-timing-debug-wrap .drums-timing-btn {
+    align-self: flex-start;
+}
+
 .drums-timing-hidden,
 .drums-timing [hidden] {
     display: none;
@@ -388,3 +413,95 @@
     border-radius: 10px;
     padding: 16px;
 }
+
+/* INIT-006/SPEC-003: in-play early/late HUD on the 2D highway (not Calibration). */
+.drums-inplay-hud {
+    position: absolute;
+    top: 36px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 4;
+    pointer-events: none;
+    min-width: 16rem;
+    max-width: min(28rem, 92%);
+    padding: 6px 10px;
+    border-radius: 6px;
+    background: rgba(8, 8, 20, 0.82);
+    border: 1px solid #1f2937;
+    color: #e5e7eb;
+    font-family: system-ui, sans-serif;
+    font-size: 12px;
+    line-height: 1.35;
+    text-align: center;
+}
+
+.drums-inplay-hud[hidden] {
+    display: none;
+}
+
+.drums-inplay-sign,
+.drums-inplay-latest,
+.drums-inplay-median {
+    margin: 0;
+}
+
+.drums-inplay-sign {
+    font-size: 10px;
+    color: #9ca3af;
+}
+
+.drums-inplay-latest {
+    margin-top: 2px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+}
+
+.drums-inplay-icon {
+    display: inline-block;
+    min-width: 1.1em;
+    margin-right: 4px;
+}
+
+.drums-inplay-median {
+    margin-top: 2px;
+    font-size: 11px;
+    color: #d1d5db;
+}
+
+/* INIT-006/SPEC-007: opt-in auto-trim on the in-play HUD (checkbox must receive clicks). */
+.drums-autotrim {
+    pointer-events: auto;
+    margin-top: 6px;
+    padding-top: 4px;
+    border-top: 1px solid #1f2937;
+    font-size: 11px;
+    color: #d1d5db;
+}
+
+.drums-autotrim-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    font-weight: 600;
+}
+
+.drums-autotrim-check {
+    margin: 0;
+}
+
+.drums-autotrim-status,
+.drums-autotrim-practice {
+    margin: 2px 0 0;
+    font-size: 10px;
+    color: #9ca3af;
+}
+
+.drums-autotrim[data-state="stable"] .drums-autotrim-status {
+    color: #86efac;
+}
+
+.drums-autotrim-practice[hidden] {
+    display: none;
+}
+
