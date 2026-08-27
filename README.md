@@ -16,9 +16,9 @@ A plugin for [Slopsmith](https://github.com/got-feedback/feedback) that replaces
 - **MIDI drum pad input** — connect any MIDI drum pad, electronic kit, or controller via Web MIDI API
 - **Custom MIDI mapping** — Settings → MIDI Learn assigns pads on a MIDI device; the Drums tab attaches a profile to that device
 - **Built-in drum sounds** — WebAudioFont-powered GM drum kit playback on MIDI hit
-- **Accuracy scoring** — hit detection with tight +/-50ms timing window, accuracy %, streak counter
+- **Accuracy scoring** — hit detection with a default ±70 ms window, or ±50 ms when **Precision** is on (Settings → Drums → Profiles). Accuracy %, streak counter. Precision is a tighter **fixed** window, not YARG density-scaled Precision.
 - **Opt-in auto-trim** — during play, collect 20 signed hit errors, drop IQR outliers, and apply half the median to the active MIDI device offset. Off by default. While it is on, the run is practice (not ranked); turn it off to score later hits. Stable when the batch median is within 5 ms.
-- **Drum settings editor** — Settings → Drums → **Profiles**: name a profile, attach a MIDI device, map lanes from that device's pads, and **Make active** (one active profile). 2D lane preset lives in the **2D Drum Highway** disclosure. Same editor from the in-song gear.
+- **Drum settings editor** — Settings → Drums → **Profiles**: name a profile, attach a MIDI device, map lanes from that device's pads, **Precision** (tighter fixed ±50 ms window), and **Make active** (one active profile). 2D lane preset lives in the **2D Drum Highway** disclosure. Same editor from the in-song gear.
 
 ## Drum Lanes
 

@@ -953,3 +953,61 @@ test('midi-device-change list refresh does not wipe GET pads', async () => {
     mod.resetForTests();
 });
 
+test('INIT-007/SPEC-004: Profiles HTML has Precision checkbox and helper', () => {
+    const mod = freshEditor();
+    const host = global.document.createElement('div');
+    const mounted = mod.mountDrumEditor(host, { context: 'settings' });
+    const html = mounted.root.innerHTML;
+    assert.match(html, /drums-chk-precision/);
+    assert.match(html, />Precision</);
+    assert.match(html, /aria-label="Precision mode"/);
+    assert.match(html, /Tighter fixed ±50 ms window/);
+    assert.match(html, /Not YARG density-scaled Precision/);
+    mod.resetForTests();
+});
+
+test('INIT-007/SPEC-004: persist scoring.precision_mode via existing profile PUT', async () => {
+    const saved = [];
+    const win = {
+        feedBack: {
+            drumProfiles: {
+                list: async () => [{
+                    id: 'living-room',
+                    name: 'Living room',
+                    device_id: '',
+                    scoring: { precision_mode: false },
+                }],
+                save: async (p) => { saved.push(JSON.parse(JSON.stringify(p))); return p; },
+                activate: async (id) => ({ id: id }),
+                get: async (id) => ({
+                    id: id,
+                    name: 'Living room',
+                    device_id: '',
+                    scoring: { precision_mode: false },
+                }),
+                getActive: async () => ({
+                    id: 'living-room',
+                    name: 'Living room',
+                    scoring: { precision_mode: false },
+                }),
+            },
+        },
+    };
+    const mod = freshEditor({ window: win });
+    const host = global.document.createElement('div');
+    mod.mountDrumEditor(host, { context: 'settings' });
+    await new Promise((r) => setTimeout(r, 0));
+    const withFlag = await mod.persistActivePatch({ scoring: { precision_mode: true } });
+    assert.equal(withFlag.ok, true);
+    assert.equal(saved.length, 1);
+    assert.equal(saved[0].scoring.precision_mode, true);
+    saved.length = 0;
+    const highwayOnly = await mod.persistActivePatch({
+        highway: { '2d': { lane_preset: 'rb4', show_lane_labels: true } },
+    });
+    assert.equal(highwayOnly.ok, true);
+    assert.equal(saved.length, 1);
+    assert.equal('scoring' in saved[0], false);
+    mod.resetForTests();
+});
+

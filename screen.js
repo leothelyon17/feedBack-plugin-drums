@@ -219,7 +219,60 @@ const VISIBLE_SECONDS = 2.0;
 const NOW_LINE_Y_FRAC = 0.85;
 const LANE_PAD = 1;
 const KICK_LANE_EXTRA = 20;
-const HIT_TOLERANCE = 0.05;        // seconds (drums need tighter timing than piano)
+// INIT-007/SPEC-004: ADR-002 windows. Precision ON = 0.05 s (±50 ms);
+// OFF / omitted / missing profile = 0.07 s (±70 ms). Live via getter.
+const HIT_TOLERANCE_DEFAULT = 0.07;
+const HIT_TOLERANCE_PRECISION = 0.05;
+let _liveHitTolerance = HIT_TOLERANCE_DEFAULT;
+
+function _precisionModeOn(profile) {
+    return Boolean(profile && profile.scoring && profile.scoring.precision_mode === true);
+}
+
+function _setHitToleranceFromProfile(profile) {
+    _liveHitTolerance = _precisionModeOn(profile)
+        ? HIT_TOLERANCE_PRECISION
+        : HIT_TOLERANCE_DEFAULT;
+    return _liveHitTolerance;
+}
+
+function _getHitTolerance() {
+    return _liveHitTolerance;
+}
+
+function _syncHitToleranceFromProfiles(detail) {
+    if (detail && detail.scoring) {
+        _setHitToleranceFromProfile(detail);
+        return;
+    }
+    if (detail && (detail.precision_mode === true || detail.precision_mode === false)) {
+        _setHitToleranceFromProfile({ scoring: { precision_mode: detail.precision_mode } });
+        return;
+    }
+    try {
+        const fb = (typeof window !== 'undefined')
+            ? (window.feedBack || window.feedback || window.slopsmith)
+            : null;
+        const api = fb && fb.drumProfiles;
+        if (!api) {
+            _setHitToleranceFromProfile(null);
+            return;
+        }
+        if (api.active && typeof api.active === 'object') {
+            _setHitToleranceFromProfile(api.active);
+            return;
+        }
+        if (typeof api.getActive === 'function') {
+            Promise.resolve(api.getActive.call(api)).then(function (p) {
+                _setHitToleranceFromProfile(p || null);
+            }).catch(function () {
+                _setHitToleranceFromProfile(null);
+            });
+            return;
+        }
+    } catch (_) { /* missing host API → default window */ }
+    _setHitToleranceFromProfile(null);
+}
 
 // ── Persisted settings ───────────────────────────────────────────────
 
@@ -1583,16 +1636,17 @@ function _judgeDrumHit(playedMidi, timeStamp, snapshot) {
     if (playedLane < 0) return { kind: 'skip', reason: 'unmapped' };
 
     const hitKeys = snap.hitKeys || new Set();
+    const hitTol = _getHitTolerance();
 
     if (notes) {
         for (const n of notes) {
-            if (n.t > t + HIT_TOLERANCE + 0.5) break;
-            if (n.t < t - HIT_TOLERANCE - 0.5) continue;
+            if (n.t > t + hitTol + 0.5) break;
+            if (n.t < t - hitTol - 0.5) continue;
             if (n._noScore) continue;
             const songMidi = noteToMidi(n.s, n.f);
             const songLane = _songNoteToLaneIdx(songMidi);
             const key = _noteKey(n.t, songMidi);
-            if (songLane === playedLane && Math.abs(n.t - t) <= HIT_TOLERANCE && !hitKeys.has(key)) {
+            if (songLane === playedLane && Math.abs(n.t - t) <= hitTol && !hitKeys.has(key)) {
                 hitKeys.add(key);
                 return { kind: 'hit', t, noteT: n.t, errorMs: _signedErrorMs(t, n.t), key, playedLane };
             }
@@ -1601,13 +1655,13 @@ function _judgeDrumHit(playedMidi, timeStamp, snapshot) {
 
     if (chords) {
         for (const c of chords) {
-            if (c.t > t + HIT_TOLERANCE + 0.5) break;
-            if (c.t < t - HIT_TOLERANCE - 0.5) continue;
+            if (c.t > t + hitTol + 0.5) break;
+            if (c.t < t - hitTol - 0.5) continue;
             for (const cn of (c.notes || [])) {
                 const songMidi = noteToMidi(cn.s, cn.f);
                 const songLane = _songNoteToLaneIdx(songMidi);
                 const key = _noteKey(c.t, songMidi);
-                if (songLane === playedLane && Math.abs(c.t - t) <= HIT_TOLERANCE && !hitKeys.has(key)) {
+                if (songLane === playedLane && Math.abs(c.t - t) <= hitTol && !hitKeys.has(key)) {
                     hitKeys.add(key);
                     return { kind: 'hit', t, noteT: c.t, errorMs: _signedErrorMs(t, c.t), key, playedLane };
                 }
@@ -2634,6 +2688,7 @@ function _syncEditorControlsFromCfg() {
 
 function _applyDrumProfile(profile) {
     if (!profile || typeof profile !== 'object') return;
+    _setHitToleranceFromProfile(profile);
     const apply = function () {
         const hw2d = profile.highway && profile.highway['2d'] ? profile.highway['2d'] : {};
         if (hw2d.lane_preset && _VALID_LANE_PRESETS.has(hw2d.lane_preset)) {
@@ -2685,15 +2740,22 @@ function _hydrateDrumEditor(root) {
             const id = cache && cache.active && cache.active.device_id;
             if (id) _refetchAttachedDevice(id);
             else _clearAttachedDevice();
+            _setHitToleranceFromProfile((cache && cache.active) || null);
         });
     }
 }
 
 function _onDrumProfileChange(ev) {
     const detail = (ev && ev.detail) || ev || {};
+    if (detail.scoring || detail.precision_mode === true || detail.precision_mode === false) {
+        _syncHitToleranceFromProfiles(detail);
+    }
     const editor = _getDrumEditor();
     const apply = function (profile) {
         if (profile) _applyDrumProfile(profile);
+        else if (!(detail.scoring || detail.precision_mode === true || detail.precision_mode === false)) {
+            _syncHitToleranceFromProfiles(detail);
+        }
     };
     // Do not refreshProfiles() here: that rebuilds the Attach select and
     // races the in-flight save (flash back to None). Scoring overlay only.
@@ -2704,6 +2766,7 @@ function _onDrumProfileChange(ev) {
         });
         return;
     }
+    apply(null);
 }
 
 function _bootSettingsEditor() {
@@ -2726,6 +2789,7 @@ function _bootSettingsEditor() {
         document.addEventListener('feedback:drum-profile-change', _onDrumProfileChange);
         const fb = window.feedBack;
         if (fb && typeof fb.on === 'function') fb.on('feedback:drum-profile-change', _onDrumProfileChange);
+        _syncHitToleranceFromProfiles();
     }
     _bindMidiDeviceScoring();
 }
@@ -3084,7 +3148,7 @@ function createFactory() {
 
     function _updateMissedNotes(t, notes, chords) {
         if (!_cfg.hitDetection) return;
-        const cutoff = t - HIT_TOLERANCE - 0.05;
+        const cutoff = t - _getHitTolerance() - 0.05;
 
         if (notes) {
             for (const n of notes) {
@@ -3994,7 +4058,9 @@ if (typeof module !== 'undefined' && module.exports) {
         _commitLearnAssignment, _confirmActiveKit, _primaryPieceForLane,
         _sanitizeKitList,
         // INIT-004/SPEC-003
-        HIT_TOLERANCE, _readDrumOffsetMs, _highwayGetTime, _judgeTimeFromMidi,
+        HIT_TOLERANCE_DEFAULT, HIT_TOLERANCE_PRECISION, _getHitTolerance,
+        _setHitToleranceFromProfile, _syncHitToleranceFromProfiles, _precisionModeOn,
+        _readDrumOffsetMs, _highwayGetTime, _judgeTimeFromMidi,
         _applyDrumOffsetSec, _audioScheduleWhen, _convertMidiFallback,
         _clocksForApply, _judgeDrumHit,
         // INIT-006/SPEC-003
@@ -4063,6 +4129,10 @@ if (typeof module !== 'undefined' && module.exports) {
             _applyDeviceNotes(device || null);
         },
     };
+    Object.defineProperty(module.exports, 'HIT_TOLERANCE', {
+        enumerable: true,
+        get: _getHitTolerance,
+    });
 }
 
 })();
