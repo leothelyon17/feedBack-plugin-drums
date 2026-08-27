@@ -131,6 +131,9 @@ function _emitProfileChange(profile) {
         profile_id: profile && profile.id ? profile.id : '',
         kit_id: profile && profile.kit_id ? profile.kit_id : '',
     };
+    if (profile && profile.scoring && typeof profile.scoring === 'object') {
+        detail.scoring = { precision_mode: profile.scoring.precision_mode === true };
+    }
     var d = _doc();
     if (d && typeof d.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
         d.dispatchEvent(new CustomEvent('feedback:drum-profile-change', { detail: detail }));
@@ -175,6 +178,9 @@ async function saveProfile(profile) {
         input: profile.input || { midi_channel: -1, hit_detection: false, synth_volume: 0.7 },
         highway: profile.highway || { '2d': { lane_preset: 'phase_shift_8', show_lane_labels: true } },
     };
+    if (profile.scoring && typeof profile.scoring === 'object') {
+        body.scoring = { precision_mode: profile.scoring.precision_mode === true };
+    }
     if ('notes' in body) delete body.notes;
     var api = _accessor();
     if (api && typeof api.save === 'function') {
@@ -394,7 +400,7 @@ function _profileFromForm(name, id, patch) {
     var deviceId = Object.prototype.hasOwnProperty.call(patch || {}, 'device_id')
         ? normalizeDeviceId(patch.device_id)
         : normalizeDeviceId(base.device_id);
-    return {
+    var out = {
         id: id,
         name: name,
         kit_id: patch.kit_id != null ? patch.kit_id : (base.kit_id || ''),
@@ -409,6 +415,12 @@ function _profileFromForm(name, id, patch) {
         ),
         highway: _mergeHighway(base.highway, patch.highway),
     };
+    if (patch && Object.prototype.hasOwnProperty.call(patch, 'scoring')) {
+        out.scoring = {
+            precision_mode: !!(patch.scoring && patch.scoring.precision_mode === true),
+        };
+    }
+    return out;
 }
 
 async function refreshProfiles() {
@@ -428,6 +440,7 @@ async function refreshProfiles() {
     _fillProfileSelect();
     _fillAttachSelect();
     _fill2dControls();
+    _fillScoringControls();
     _updateActivateButton();
     await _loadAttachedDevice(_wantedDeviceId());
     _fillLaneGrid();
@@ -567,6 +580,7 @@ async function persistActivePatch(patch) {
         if (stored && typeof stored === 'object') {
             stored.device_id = next.device_id;
             if (next.highway) stored.highway = next.highway;
+            if (next.scoring) stored.scoring = next.scoring;
         }
         _cache.selected = stored;
         _cache.selectedId = id;
@@ -645,6 +659,9 @@ async function _submitNameForm() {
         input: src.input || { midi_channel: -1, hit_detection: false, synth_volume: 0.7 },
         highway: _mergeHighway(src.highway, {}),
     };
+    if (src.scoring && typeof src.scoring === 'object') {
+        created.scoring = { precision_mode: src.scoring.precision_mode === true };
+    }
     var put = await saveProfile(created);
     if (!put.ok) {
         _live(_mount.root, 'Could not create profile.');
@@ -677,6 +694,7 @@ async function _onSelectProfile(id) {
     _fillProfileSelect();
     _fillAttachSelect();
     _fill2dControls();
+    _fillScoringControls();
     _updateActivateButton();
     await _loadAttachedDevice(_wantedDeviceId());
     _fillLaneGrid();
@@ -824,6 +842,13 @@ function _fill2dControls() {
     if (sel) sel.value = preset;
     var chk = _mount.root.querySelector('.drums-chk-labels');
     if (chk) chk.checked = two.show_lane_labels !== false;
+}
+
+function _fillScoringControls() {
+    if (!_mount || !_mount.root) return;
+    var profile = _editingProfile();
+    var chk = _mount.root.querySelector('.drums-chk-precision');
+    if (chk) chk.checked = !!(profile && profile.scoring && profile.scoring.precision_mode === true);
 }
 
 function _updateActivateButton() {
@@ -1038,6 +1063,17 @@ function _editorHtml(opts) {
                 '<button type="button" class="drums-profile-name-cancel">Cancel</button>' +
             '</form>' +
             '<p class="drums-editor-live" role="status" aria-live="polite"></p>' +
+            '<div class="drums-editor-row drums-precision-row">' +
+                '<label class="drums-editor-check">' +
+                    '<input type="checkbox" class="drums-chk-precision"' +
+                        ' aria-label="Precision mode"' +
+                        ' aria-describedby="drums-precision-hint">' +
+                    '<span>Precision</span>' +
+                '</label>' +
+                '<p class="drums-precision-hint" id="drums-precision-hint">' +
+                    'Tighter fixed ±50 ms window. Not YARG density-scaled Precision.' +
+                '</p>' +
+            '</div>' +
         '</div>' +
         '<section class="drums-editor-section" data-drums-section="attach" aria-labelledby="drums-editor-attach-h">' +
             '<h3 id="drums-editor-attach-h">MIDI device</h3>' +
@@ -1110,6 +1146,12 @@ function _wireChrome(root) {
     root.querySelector('.drums-profile-name-cancel').onclick = function () {
         _hideNameForm();
     };
+    var precision = root.querySelector('.drums-chk-precision');
+    if (precision) {
+        precision.onchange = function () {
+            persistActivePatch({ scoring: { precision_mode: !!this.checked } });
+        };
+    }
     var attach = root.querySelector('.drums-attach-select');
     if (attach) {
         attach.onchange = function () {

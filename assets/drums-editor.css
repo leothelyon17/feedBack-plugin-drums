@@ -78,6 +78,21 @@
     cursor: pointer;
 }
 
+/* INIT-007/SPEC-004: Precision checkbox — plugin-owned; not core Tailwind. */
+.drums-precision-row {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.drums-precision-hint {
+    margin: 0;
+    font-size: 11px;
+    color: #9ca3af;
+    max-width: 36rem;
+    line-height: 1.35;
+}
+
 .drums-editor button {
     background: #1a1a2e;
     border: 1px solid #444;

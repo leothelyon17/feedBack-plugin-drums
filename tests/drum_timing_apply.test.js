@@ -160,11 +160,65 @@ test('ac-4: discarded timeStamp vs consumed timeStamp disagree when A/V is non-z
     assert.equal(discarded, tChart + avMs / 1000);
 });
 
-test('ac-5: HIT_TOLERANCE remains 0.05 s', () => {
+test('ac-5: HIT_TOLERANCE is live Default 0.07 s / Precision 0.05 s', () => {
     const mod = freshPlugin();
+    assert.equal(mod.HIT_TOLERANCE_DEFAULT, 0.07);
+    assert.equal(mod.HIT_TOLERANCE_PRECISION, 0.05);
+    assert.equal(mod._getHitTolerance(), 0.07);
+    assert.equal(mod.HIT_TOLERANCE, 0.07);
+    assert.match(SCREEN_SRC, /HIT_TOLERANCE_DEFAULT = 0\.07/);
+    assert.match(SCREEN_SRC, /HIT_TOLERANCE_PRECISION = 0\.05/);
+    assert.doesNotMatch(SCREEN_SRC, /const HIT_TOLERANCE = 0\.05/);
+
+    mod._setHitToleranceFromProfile(null);
+    assert.equal(mod._getHitTolerance(), 0.07);
+    mod._setHitToleranceFromProfile({});
+    assert.equal(mod._getHitTolerance(), 0.07);
+    mod._setHitToleranceFromProfile({ scoring: { precision_mode: false } });
+    assert.equal(mod._getHitTolerance(), 0.07);
+    mod._setHitToleranceFromProfile({ scoring: {} });
+    assert.equal(mod._getHitTolerance(), 0.07);
+    mod._setHitToleranceFromProfile({ scoring: { precision_mode: 'yes' } });
+    assert.equal(mod._getHitTolerance(), 0.07);
+    mod._setHitToleranceFromProfile({ scoring: { precision_mode: true } });
+    assert.equal(mod._getHitTolerance(), 0.05);
     assert.equal(mod.HIT_TOLERANCE, 0.05);
-    assert.match(SCREEN_SRC, /const HIT_TOLERANCE = 0\.05/);
-    assert.doesNotMatch(SCREEN_SRC, /HIT_TOLERANCE\s*=\s*0\.(?!05)\d/);
+});
+
+test('ac-5: feedback:drum-profile-change updates live tolerance', () => {
+    const mod = freshPlugin();
+    assert.match(SCREEN_SRC, /feedback:drum-profile-change/);
+    mod._setHitToleranceFromProfile(null);
+    assert.equal(mod._getHitTolerance(), 0.07);
+    mod._onDrumProfileChange({ detail: { scoring: { precision_mode: true } } });
+    assert.equal(mod._getHitTolerance(), 0.05);
+    mod._onDrumProfileChange({ detail: { precision_mode: false } });
+    assert.equal(mod._getHitTolerance(), 0.07);
+});
+
+test('ac-4: 40 ms late hits and 80 ms late misses in default; 60 ms late misses in precision', () => {
+    const mod = freshPlugin();
+    const notes = mappedSnare(mod);
+    const base = {
+        notes, chords: [], now: 1000, offsetMs: 0,
+    };
+    mod._setHitToleranceFromProfile(null);
+    assert.equal(mod._getHitTolerance(), 0.07);
+    assert.equal(mod._judgeDrumHit(38, 1000, {
+        ...base, getTime: () => 1.04, hitKeys: new Set(),
+    }).kind, 'hit');
+    assert.equal(mod._judgeDrumHit(38, 1000, {
+        ...base, getTime: () => 1.08, hitKeys: new Set(),
+    }).kind, 'miss');
+
+    mod._setHitToleranceFromProfile({ scoring: { precision_mode: true } });
+    assert.equal(mod._getHitTolerance(), 0.05);
+    assert.equal(mod._judgeDrumHit(38, 1000, {
+        ...base, getTime: () => 1.04, hitKeys: new Set(),
+    }).kind, 'hit');
+    assert.equal(mod._judgeDrumHit(38, 1000, {
+        ...base, getTime: () => 1.06, hitKeys: new Set(),
+    }).kind, 'miss');
 });
 
 test('ac-6: never calls setAvOffset / never writes av_offset_ms', () => {
@@ -249,15 +303,16 @@ test('offset 0 is bit-identical to getTime when the stamp maps cleanly', () => {
     assert.equal(mod._judgeTimeFromMidi(100, { getTime: () => tChart, now: 100, offsetMs: 0 }), tChart);
 });
 
-test('HIT_TOLERANCE window: on-time hits, 60 ms miss, flam _noScore skipped', () => {
+test('HIT_TOLERANCE window: on-time hits, 80 ms miss in default, flam _noScore skipped', () => {
     const mod = freshPlugin();
     const notes = mappedSnare(mod);
     const base = {
         notes, chords: [], getTime: () => 1.0, now: 1000, offsetMs: 0,
     };
+    mod._setHitToleranceFromProfile(null);
     assert.equal(mod._judgeDrumHit(38, 1000, { ...base, hitKeys: new Set() }).kind, 'hit');
     assert.equal(mod._judgeDrumHit(38, 1000, {
-        ...base, getTime: () => 1.06, hitKeys: new Set(),
+        ...base, getTime: () => 1.08, hitKeys: new Set(),
     }).kind, 'miss');
     assert.equal(mod._judgeDrumHit(38, 1000, {
         ...base, getTime: () => 1.04, hitKeys: new Set(),
